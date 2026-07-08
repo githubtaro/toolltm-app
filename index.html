@@ -69,7 +69,7 @@
 
 <header>
   <h1>Tool<span>Ltm</span></h1>
-  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.5</div>
+  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.8</div>
 </header>
 
 <h2>0. USBフォルダ一括取り込み</h2>
@@ -342,13 +342,15 @@ function parseNoteLine(line){
   const mc = s.match(/\b(d1|d2|w1|w2)\b/i); if(mc) r.machine = mc[1].toLowerCase();
   // 種別
   for(const k of Object.keys(KIND)){ if(new RegExp("\\b"+k+"\\b").test(s) || s.includes(k)){ r.kind = k; break; } }
-  // テンプレA/B/C（種別の後ろの単独大文字、または TiA B のような並び）
-  const tpl = s.match(/\b(TiA|TiP)\b\s+\w+\s+([ABC])\b/) || s.match(/\b([ABC])\b(?!\d)/);
-  if(tpl) r.template = tpl[tpl.length-1];
-  // 材料
+  // 材料（テンプレ抽出より先に確定させる: 単独A/B/CのフォールバックをMetal系限定にするため）
   const mat = s.match(/\b(TiA|TiP|Stone|WAX|PMMA|PEEK|HR)\b/i); if(mat) r.material = mat[1];
   // CAD注記（第2信号）: "CAD Cr" 等 → CAD/CAM冠確定。PEEKが明記されていればそちら優先
   if(/\bCAD\b/i.test(s) && !/PEEK/i.test(s)) r.material = "CADCAM";
+  // テンプレA/B/C: "TiA B"の並びは常に採用。単独大文字のフォールバックはMetal系(TiA/TiP)ジョブのみ。
+  // CAD/CAM冠の"Br"のBや"CAD"のCを誤ってテンプレ扱いしないため。Metal注記はTiA/TiPトークン必須。
+  const isMetalJob = /^(TIA|TIP)$/i.test(r.material || "");
+  const tpl = s.match(/\b(TiA|TiP)\b\s+\w+\s+([ABC])\b/) || (isMetalJob ? s.match(/\b([ABC])\b(?!\d)/) : null);
+  if(tpl) r.template = tpl[tpl.length-1];
   // 歯番 #45-47 等
   const teeth = s.match(/#\s*([\d\-,]+)/); if(teeth) r.teeth = teeth[1];
   // ユニット内訳（I. 辞書）
@@ -382,8 +384,8 @@ function expectedBars(material, template){
 // E. ユニット内訳の補完
 function fillUnits(j){
   if(j.kind==="Con"){ if(j.units==null) j.units=j.abut??2; j.pontic=0; if(j.abut==null)j.abut=j.units; }
-  // Br は内訳欠落時に補完しない（定義ルールE：ユーザーに要求）→ フラグ
-  if(j.kind==="Br" && (j.abut==null || j.pontic==null)) j.needUnitInput = true;
+  // Br: 内訳(支台/ポン)は使い道未定のため要求しない（v0.8, 案A）。
+  // 注記に書かれていれば上のパーサー(r.abut/r.pontic)が機会的に拾う。歯番はj.teethに保持済み。
   return j;
 }
 // ログ全体をジョブ配列に
@@ -660,7 +662,10 @@ $("btnBackup").onclick = () => {
 };
 $("btnRestore").onclick = () => $("fileRestore").click();
 $("fileRestore").onchange = e => {
-  const f = e.target.files[0]; if(!f) return;
+  const input = e.target;
+  const f = input.files[0];
+  input.value = "";   // 同じファイルを選び直しても再発火させる（fはFile参照を保持済みなので読み込みに影響なし）
+  if(!f) return;
   const r = new FileReader();
   r.onload = () => {
     try{
@@ -810,7 +815,7 @@ $("btnJobParse").onclick = () => {
     html+=`<tr><td>${j.hhmm?j.hhmm.slice(0,2)+":"+j.hhmm.slice(2,4):"—"}</td><td>${j.machine||"?"}</td>
       <td>${(j.material==="CADCAM"?"CAD/CAM":(j.material||"?"))+" "+(j.thick||"")}</td><td style="text-align:left">${fmtUnits(j)||esc(j.note)||"—"}</td>
       <td>${j.expectedBars?j.expectedBars.join("/"):"—"}</td><td>${j.isBlock?"ブロック":"ディスク"}</td>
-      <td>${j.materialAssumed?'<span class="tag info">CAD/CAM仮定</span>':""}${j.needUnitInput?'<span class="tag warn">Br内訳要確認</span>':""}${!j.material?'<span class="tag bad">材料不明</span>':""}</td></tr>`;
+      <td>${j.materialAssumed?'<span class="tag info">CAD/CAM仮定</span>':""}${!j.material?'<span class="tag bad">材料不明</span>':""}</td></tr>`;
   }
   html+="</tbody></table>";
   msg.className="msg ok"; msg.textContent=`${jobs.length}件のジョブを解析。内容を確認して登録。`;
