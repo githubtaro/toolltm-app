@@ -69,7 +69,7 @@
 
 <header>
   <h1>Tool<span>Ltm</span></h1>
-  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.8</div>
+  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.10</div>
 </header>
 
 <h2>0. USBフォルダ一括取り込み</h2>
@@ -367,7 +367,7 @@ function parseNoteLine(line){
   const bs = s2.match(/(?:^|\s)(\d{2}(?:XLL|XL|L)?)(?=\s|$)/);
   if(bs) r.blockSize = bs[1];
   // テンプレート名（insurance_v2 等）: 文字列として保持するだけ。辞書は持たない
-  const tn = s.match(/\b([A-Za-z]+_v\d+)\b/) || s.match(/\b(insurance\w*)\b/i);
+  const tn = s.match(/\b([A-Za-z]+_v\d+)\b/) || s.match(/\b(insurance\w*)\b/i) || s.match(/\b(Slow)\b/i);
   if(tn) r.templateName = tn[1];
   return r;
 }
@@ -428,9 +428,11 @@ function parseJobLog(text){
   return jobs;
 }
 // 突合: ジョブのHHMM以降で、期待バーに一致するセグメントを拾いバー別実消費を出す
-function matchSegments(db, job, dateStr){
+function matchSegments(db, job, dateStr, startFloor){
   if(!job.hhmm || !job.machine) return null;
-  const start = dateStr + "T" + job.hhmm.slice(0,2) + ":" + job.hhmm.slice(2,4);
+  // NC出力時刻を下限とするが、直前ジョブが消費し終えた時刻(カーソル)があればそちらを優先（v0.10 順次消費）
+  const base = dateStr + "T" + job.hhmm.slice(0,2) + ":" + job.hhmm.slice(2,4);
+  const start = (startFloor && startFloor > base) ? startFloor : base;
   const segs = db.segments
     .filter(s => s.machine===job.machine && s.a >= start)
     .sort((a,b)=> a.a<b.a?-1:1);
@@ -445,7 +447,7 @@ function matchSegments(db, job, dateStr){
     const dur = Math.round((Date.parse(s.b)-Date.parse(s.a))/1000);
     used[bar]=(used[bar]||0)+dur; picked.push({bar,dur,a:s.a,b:s.b}); seen.add(bar);
   }
-  return picked.length? {used, picked} : null;
+  return picked.length? {used, picked, lastEnd: picked[picked.length-1].b} : null;
 }
 
 // ---------- diff ----------
@@ -531,13 +533,13 @@ function renderExchanges(){
   const db = loadDB();
   const area = $("exchangeArea");
   if(!db.exchanges.length){ area.className="empty"; area.textContent="まだ交換イベントの記録なし。"; return; }
-  let html = `<table><thead><tr><th>検知日</th><th>マシン</th><th>バー</th><th>生涯RunTime(実測下限)</th><th>交換時Cutting累計</th><th>前回観測</th><th></th></tr></thead><tbody>`;
+  let html = `<table><thead><tr><th>検知日</th><th>マシン</th><th>バー</th><th>生涯RunTime</th><th>交換時Cutting累計</th><th>前回観測</th><th></th></tr></thead><tbody>`;
   for(const e of [...db.exchanges].sort((a,b)=>a.detectedAt<b.detectedAt?1:-1)){
     html += `<tr><td>${e.detectedAt.replace("T"," ")}</td><td>${e.machine}</td><td><b>${e.type}</b></td>
-      <td>${secToHms(e.finalRun)}</td><td>${secToHms(e.cutAtExchange)}</td><td>${e.prevTakenAt.replace("T"," ")}</td>
-      <td><button class="ghost" style="padding:2px 8px;font-size:11px" onclick="delExchange('${e.id}')">削除</button></td></tr>`;
+      <td>${secToHms(e.finalRun)}${e.finalRunEdited?' <span class="tag info">手入力</span>':''}</td><td>${secToHms(e.cutAtExchange)}</td><td>${e.prevTakenAt.replace("T"," ")}</td>
+      <td><button class="ghost" style="padding:2px 8px;font-size:11px" onclick="editExchange('${e.id}')">編集</button> <button class="ghost" style="padding:2px 8px;font-size:11px" onclick="delExchange('${e.id}')">削除</button></td></tr>`;
   }
-  html += "</tbody></table><div class='msg'>「生涯RunTime」は前回スナップショット時点の値。前回取得〜交換の間に加工があった分は含まれない（＝下限値）。厳密値が要る場合は交換直前にもコピーを取ること。</div>";
+  html += "</tbody></table><div class='msg'>「生涯RunTime」は前回スナップショット時点の値。前回取得〜交換の間に加工があった分は含まれない（＝下限値）。厳密値が要る場合は交換直前にもコピーを取ること。「手入力」バッジは機械画面のメモ/写真値で補正済みの行。</div>";
   area.className = "";
   area.innerHTML = html;
 }
@@ -556,6 +558,19 @@ function delExchange(id){
   if(!confirm("この交換イベントを削除する？（誤検知の後始末用）")) return;
   const db = loadDB();
   db.exchanges = db.exchanges.filter(e => e.id !== id);
+  saveDB(db); renderExchanges();
+}
+function editExchange(id){
+  const db = loadDB();
+  const e = db.exchanges.find(x => x.id === id);
+  if(!e) return;
+  const cur = secToHms(e.finalRun);
+  const v = prompt("生涯RunTimeをHH:MM:SSで入力（機械画面のメモ/写真値で補正）", cur);
+  if(v == null) return;                                     // キャンセル
+  if(!/^\d{1,3}:\d{1,2}:\d{1,2}$/.test(v.trim())){ alert("HH:MM:SS形式で入力すること。中止した。"); return; }
+  const sec = hmsToSec(v.trim());
+  if(sec < e.finalRun && !confirm("記録値("+cur+")は実測下限のため、それ未満は通常あり得ない。続行？")) return;
+  e.finalRun = sec; e.finalRunEdited = true;
   saveDB(db); renderExchanges();
 }
 function delSnap(id){
@@ -651,9 +666,9 @@ $("btnCsvDiff").onclick = () => {
 $("btnCsvEx").onclick = () => {
   const db = loadDB();
   if(!db.exchanges.length){ $("dataMsg").textContent = "交換履歴がまだ空。"; return; }
-  let csv = "\uFEFF検知日時,マシン,バー,生涯RunTime秒,生涯RunTime,交換時Cutting累計,前回観測\n";
+  let csv = "\uFEFF検知日時,マシン,バー,生涯RunTime秒,生涯RunTime,交換時Cutting累計,前回観測,手入力補正\n";
   for(const e of db.exchanges){
-    csv += [e.detectedAt, e.machine, e.type, e.finalRun, secToHms(e.finalRun), secToHms(e.cutAtExchange), e.prevTakenAt].join(",") + "\n";
+    csv += [e.detectedAt, e.machine, e.type, e.finalRun, secToHms(e.finalRun), secToHms(e.cutAtExchange), e.prevTakenAt, e.finalRunEdited?1:0].join(",") + "\n";
   }
   download("toolltm_exchanges.csv", csv, "text/csv");
 };
@@ -801,6 +816,7 @@ function fmtUnits(j){
   const u=[];
   if(j.units!=null)u.push("全"+j.units); if(j.abut!=null)u.push("支"+j.abut);
   if(j.pontic!=null)u.push("ポ"+j.pontic); if(j.veneer!=null)u.push("前"+j.veneer);
+  if(j.userdef!=null)u.push("ユ"+j.userdef);
   if(u.length)p.push(u.join("/"));
   return p.join(" ");
 }
@@ -827,7 +843,9 @@ $("btnJobSave").onclick = () => {
   let n=0;
   for(const j of pendingJobs){
     const id="j"+Date.now()+"_"+n;
-    db.jobs.push({id, date, machine:j.machine||$("jobMachine").value, ...j}); n++;
+    // 加工日はNC名のymd(8桁)優先、無ければUIの日付（v0.10。既定=今日のまま前日ログを貼るfootgun対策）
+    const jd = j.ymd ? j.ymd.slice(0,4)+"-"+j.ymd.slice(4,6)+"-"+j.ymd.slice(6,8) : date;
+    db.jobs.push({id, date: jd, machine:j.machine||$("jobMachine").value, ...j}); n++;
   }
   saveDB(db);
   $("jobParseMsg").className="msg ok"; $("jobParseMsg").textContent=`${n}件を登録した。`;
@@ -842,17 +860,22 @@ function renderJobs(){
   const list=db.jobs.filter(j=>(!m||j.machine===m)&&(!d||j.date===d)).sort((a,b)=>(a.date+a.hhmm)<(b.date+b.hhmm)?-1:1);
   if(!list.length){ area.className="empty"; area.textContent="該当なし。"; return; }
   let html=`<table><thead><tr><th>日付</th><th>時刻</th><th>マシン</th><th>加工物</th><th>期待バー</th><th>実消費(セグメント突合)</th><th></th></tr></thead><tbody>`;
+  // 順次消費（v0.10）: listは既に(date+hhmm)昇順。マシン別カーソルを持ち、突合できた分だけ前へ進める
+  const cursors={};
   for(const j of list){
-    const mt=matchSegments(db,j,j.date);
+    const mt=matchSegments(db,j,j.date,cursors[j.machine]??null);
     let real="—";
-    if(mt){ real=Object.keys(mt.used).sort((a,b)=>a-b).map(b=>`${b}=${secToHms(mt.used[b])}`).join(" / "); }
+    if(mt){
+      cursors[j.machine]=mt.lastEnd;   // 不突合(null)のときは据え置き＝後続ジョブの窓を狭めない
+      real=Object.keys(mt.used).sort((a,b)=>a-b).map(b=>`${b}=${secToHms(mt.used[b])}`).join(" / ");
+    }
     html+=`<tr><td>${j.date}</td><td>${j.hhmm?j.hhmm.slice(0,2)+":"+j.hhmm.slice(2,4):"—"}</td><td>${j.machine||"?"}</td>
       <td style="text-align:left">${fmtUnits(j)||esc(j.note)||esc(j.raw)}</td>
       <td>${j.expectedBars?j.expectedBars.join("/"):"—"}</td>
       <td style="text-align:left">${real}</td>
       <td><button class="ghost" style="padding:2px 8px;font-size:11px" onclick="delJob('${j.id}')">削除</button></td></tr>`;
   }
-  html+="</tbody></table><div class='msg'>実消費は加工物のNC時刻以降・期待バーが一巡するまでのセグメントを合計。段取り時間は含まない。セグメント未取込のマシンは「—」。</div>";
+  html+="</tbody></table><div class='msg'>実消費は加工物のNC時刻以降・期待バーが一巡するまでのセグメントを合計。連続ネスト時は直前ジョブの消費終了以降から突合（v0.10順次消費）。段取り時間は含まない。セグメント未取込のマシンは「—」。</div>";
   area.className=""; area.innerHTML=html;
 }
 function delJob(id){ if(!confirm("この加工物記録を削除する？"))return; const db=loadDB(); db.jobs=db.jobs.filter(j=>j.id!==id); saveDB(db); renderJobs(); }
