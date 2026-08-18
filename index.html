@@ -69,7 +69,7 @@
 
 <header>
   <h1>Tool<span>Ltm</span></h1>
-  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.11</div>
+  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.12</div>
 </header>
 
 <h2>0. USBフォルダ一括取り込み</h2>
@@ -193,11 +193,13 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;");
 
 // ---------- storage ----------
+const SEG_EPOCH = "2026-07-01"; // v0.12 間引き: これより古いセグメントは保持しない(ジョブ突合対象は2026-07以降。d系10年分の流入でlocalStorage 5MB上限を突いた対策)
 function loadDB(){
   try{
     const d = JSON.parse(localStorage.getItem(LSKEY)) || {};
     const db = {snapshots:d.snapshots||[], exchanges:d.exchanges||[], segments:d.segments||[], jobs:d.jobs||[]};
     for(const s of db.snapshots) fixW2Types(s.machine, s.tools);   // v0.11 w2個体差補正（過去分も読み替え）
+    db.segments = db.segments.filter(s => s.a >= SEG_EPOCH);         // v0.12 間引き（保存時に反映され容量が空く）
     return db;
   }
   catch(e){ return {snapshots:[], exchanges:[], segments:[], jobs:[]}; }
@@ -450,9 +452,17 @@ function matchSegments(db, job, dateStr, startFloor){
     .sort((a,b)=> a.a<b.a?-1:1);
   // 期待バーのセットが一巡するまでを1加工物ぶんとみなす（荒→中→仕上で各1回想定）
   const want = new Set(job.expectedBars||[]);
+  // v0.12 隣接同一スロット統合: 校正等の再測定で「装着→装着」が連続し細切れになる分を1本に均してから突合
+  const MERGE_GAP = 120000;
+  const mseg = [];
+  for(const s of segs){
+    const p = mseg[mseg.length-1];
+    if(p && p.slot===s.slot && Date.parse(s.a) - Date.parse(p.b) <= MERGE_GAP){ p.b = s.b; }
+    else mseg.push({slot:s.slot, a:s.a, b:s.b});
+  }
   const used = {}; const picked=[]; const seen=new Set();
   const PARKJ = 12 * 3600 * 1000;  // v0.11: 稼働セグメント画面と同じ12h跨ぎ除外（装着放置・電源断は消費に数えない）
-  for(const s of segs){
+  for(const s of mseg){
     if(Date.parse(s.b) - Date.parse(s.a) > PARKJ) continue;  // 放置は拾わず・打ち切りもしない
     const bar = barOf(db, job.machine, s.slot, s.b);
     if(bar==null) continue;
@@ -745,6 +755,7 @@ $("dirPick").onchange = async e => {
     const dup = db.snapshots.find(s => s.machine === machine &&
       Math.abs(Date.parse(s.takenAt) - Date.parse(takenAt)) < 120000);
     if(dup){ log.push(`スキップ: ${machine} INI（同時刻のスナップショット登録済み）`); continue; }
+    try{
     const {tools} = parseIni(await readFileText(f));
     fixW2Types(machine, tools);   // v0.11 w2個体差補正（保存前に読み替え）
     if(!tools.length){ log.push(`スキップ: ${machine} INI（有効工具0本）`); continue; }
@@ -762,24 +773,30 @@ $("dirPick").onchange = async e => {
     const diff = buildDiff({tools}, prev);
     const ex = commitSnapshot(machine, takenAt, tools, prev, diff);
     log.push(`登録: ${machine} スナップショット ${takenAt.replace("T"," ")}（${tools.length}本${ex ? "、交換検知"+ex+"件" : ""}）`);
+    }catch(err){ log.push(`エラー: ${machine} INI処理失敗（${err.name}: ${err.message}）`); }
   }
   for(const f of logs){
     const machine = machineFromPath(f.webkitRelativePath);
     if(!machine){ log.push(`スキップ: ${f.webkitRelativePath}（マシン判定不可）`); continue; }
-    const segs = parseMeasure(await readFileText(f));
-    const db = loadDB();
-    const known = new Set(db.segments.filter(s => s.machine === machine).map(s => s.a));
-    let added = 0;
-    for(const s of segs){
-      if(known.has(s.a)) continue;
-      db.segments.push({machine, slot:s.slot, a:s.a, b:s.b, broken:!!s.broken});
-      added++;
-    }
-    saveDB(db);
-    log.push(`取込: ${machine} Measureログ（新規セグメント${added}件 / 全${segs.length}件）`);
-    if(added){
-      $("segMachine").value = machine;
-      $("segDate").value = db.segments.filter(s=>s.machine===machine).map(s=>s.a).sort().pop().slice(0,10);
+    try{
+      const segs = parseMeasure(await readFileText(f));
+      const db = loadDB();
+      const known = new Set(db.segments.filter(s => s.machine === machine).map(s => s.a));
+      let added = 0, old = 0;
+      for(const s of segs){
+        if(s.a < SEG_EPOCH){ old++; continue; }   // v0.12 間引き: 古い履歴は取り込まない
+        if(known.has(s.a)) continue;
+        db.segments.push({machine, slot:s.slot, a:s.a, b:s.b, broken:!!s.broken});
+        added++;
+      }
+      saveDB(db);
+      log.push(`取込: ${machine} Measureログ（新規セグメント${added}件 / 全${segs.length}件${old?`、${SEG_EPOCH}以前の${old}件は間引き`:""}）`);
+      if(added){
+        $("segMachine").value = machine;
+        $("segDate").value = db.segments.filter(s=>s.machine===machine).map(s=>s.a).sort().pop().slice(0,10);
+      }
+    }catch(err){
+      log.push(`エラー: ${machine} Measureログ処理失敗（${err.name}: ${err.message}）`);   // v0.12 無言死の禁止
     }
   }
   $("dirLog").innerHTML = log.map(l => l.replace(/&/g,"&amp;").replace(/</g,"&lt;")).join("<br>") || "対象ファイルが見つからなかった。";
