@@ -69,7 +69,7 @@
 
 <header>
   <h1>Tool<span>Ltm</span></h1>
-  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.10</div>
+  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.11</div>
 </header>
 
 <h2>0. USBフォルダ一括取り込み</h2>
@@ -196,9 +196,21 @@ const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;");
 function loadDB(){
   try{
     const d = JSON.parse(localStorage.getItem(LSKEY)) || {};
-    return {snapshots:d.snapshots||[], exchanges:d.exchanges||[], segments:d.segments||[], jobs:d.jobs||[]};
+    const db = {snapshots:d.snapshots||[], exchanges:d.exchanges||[], segments:d.segments||[], jobs:d.jobs||[]};
+    for(const s of db.snapshots) fixW2Types(s.machine, s.tools);   // v0.11 w2個体差補正（過去分も読み替え）
+    return db;
   }
   catch(e){ return {snapshots:[], exchanges:[], segments:[], jobs:[]}; }
+}
+// v0.11 w2個体差補正(§3): C系Type名札の1スロット前ズレ(Tool016=67/017=69/018=18)を物理(66/67/69)に読み替える。
+// シグネチャが完全に揃った時のみ発動 → 機械側で登録が直れば自動失効。冪等（補正済みには何もしない）。
+function fixW2Types(machine, tools){
+  if(machine !== "w2" || !tools) return tools;
+  const by = {}; for(const t of tools) by[t.slot] = t;
+  if(by[16] && by[16].type===67 && by[17] && by[17].type===69 && by[18] && by[18].type===18){
+    by[16].type = 66; by[17].type = 67; by[18].type = 69;
+  }
+  return tools;
 }
 function saveDB(db){ localStorage.setItem(LSKEY, JSON.stringify(db)); }
 
@@ -439,7 +451,9 @@ function matchSegments(db, job, dateStr, startFloor){
   // 期待バーのセットが一巡するまでを1加工物ぶんとみなす（荒→中→仕上で各1回想定）
   const want = new Set(job.expectedBars||[]);
   const used = {}; const picked=[]; const seen=new Set();
+  const PARKJ = 12 * 3600 * 1000;  // v0.11: 稼働セグメント画面と同じ12h跨ぎ除外（装着放置・電源断は消費に数えない）
   for(const s of segs){
+    if(Date.parse(s.b) - Date.parse(s.a) > PARKJ) continue;  // 放置は拾わず・打ち切りもしない
     const bar = barOf(db, job.machine, s.slot, s.b);
     if(bar==null) continue;
     if(want.size && !want.has(bar)) break;       // 期待外のバーが来たら次ジョブに入ったとみなす
@@ -592,6 +606,7 @@ $("btnParse").onclick = () => {
   if(tools.length === 0){ msg.className="msg err"; msg.textContent=`セクション${sections}個を読んだが有効な工具が0本（全てType=0またはflag=1040）。`; $("btnSave").disabled=true; pending=null; renderDiff(); return; }
   const machine = $("machine").value;
   const takenAt = $("takenAt").value || nowLocalIso();
+  fixW2Types(machine, tools);   // v0.11 w2個体差補正（prev側はloadDBで補正済み、差分をType読み替え後同士で取る）
   const db = loadDB();
   const prev = latestSnapshot(db, machine, takenAt);
   const diff = buildDiff({tools}, prev);
@@ -707,6 +722,13 @@ function machineFromPath(relPath){
   const m = /^(d1|d2|w1|w2)[-_. ]/.exec(f);        // ファイル名接頭辞 d2-xxx / d2_xxx
   return m ? m[1] : null;
 }
+// v0.11: d系MeasureログのUTF-16対策。UTF-8で読んでNUL文字が混ざる場合のみUTF-16LEで再デコード（正常なUTF-8には無影響）
+async function readFileText(f){
+  const buf = await f.arrayBuffer();
+  let text = new TextDecoder("utf-8").decode(buf);
+  if(text.indexOf("\u0000") !== -1) text = new TextDecoder("utf-16le").decode(buf);
+  return text;
+}
 $("btnDir").onclick = () => $("dirPick").click();
 $("dirPick").onchange = async e => {
   const files = [...e.target.files];
@@ -723,7 +745,8 @@ $("dirPick").onchange = async e => {
     const dup = db.snapshots.find(s => s.machine === machine &&
       Math.abs(Date.parse(s.takenAt) - Date.parse(takenAt)) < 120000);
     if(dup){ log.push(`スキップ: ${machine} INI（同時刻のスナップショット登録済み）`); continue; }
-    const {tools} = parseIni(await f.text());
+    const {tools} = parseIni(await readFileText(f));
+    fixW2Types(machine, tools);   // v0.11 w2個体差補正（保存前に読み替え）
     if(!tools.length){ log.push(`スキップ: ${machine} INI（有効工具0本）`); continue; }
     const prev = latestSnapshot(db, machine, takenAt);
     if(prev){
@@ -743,7 +766,7 @@ $("dirPick").onchange = async e => {
   for(const f of logs){
     const machine = machineFromPath(f.webkitRelativePath);
     if(!machine){ log.push(`スキップ: ${f.webkitRelativePath}（マシン判定不可）`); continue; }
-    const segs = parseMeasure(await f.text());
+    const segs = parseMeasure(await readFileText(f));
     const db = loadDB();
     const known = new Set(db.segments.filter(s => s.machine === machine).map(s => s.a));
     let added = 0;
@@ -840,15 +863,19 @@ $("btnJobParse").onclick = () => {
 $("btnJobSave").onclick = () => {
   if(!pendingJobs) return;
   const db=loadDB(); const date=$("jobDate").value||new Date().toISOString().slice(0,10);
-  let n=0;
+  // v0.11: raw(NC名)でのdedup。dir出力の貼り付けは累積のため、登録済みジョブは黙ってスキップする
+  const seenRaw = new Set(db.jobs.map(x=>x.raw).filter(Boolean));
+  let n=0, skipped=0;
   for(const j of pendingJobs){
+    if(j.raw && seenRaw.has(j.raw)){ skipped++; continue; }
+    if(j.raw) seenRaw.add(j.raw);
     const id="j"+Date.now()+"_"+n;
     // 加工日はNC名のymd(8桁)優先、無ければUIの日付（v0.10。既定=今日のまま前日ログを貼るfootgun対策）
     const jd = j.ymd ? j.ymd.slice(0,4)+"-"+j.ymd.slice(4,6)+"-"+j.ymd.slice(6,8) : date;
     db.jobs.push({id, date: jd, machine:j.machine||$("jobMachine").value, ...j}); n++;
   }
   saveDB(db);
-  $("jobParseMsg").className="msg ok"; $("jobParseMsg").textContent=`${n}件を登録した。`;
+  $("jobParseMsg").className="msg ok"; $("jobParseMsg").textContent=`${n}件を登録した。`+(skipped?`（登録済みスキップ${skipped}件）`:"");
   $("btnJobSave").disabled=true; $("jobPreview").innerHTML=""; $("jobInput").value="";
   $("jobViewMachine").value=""; $("jobViewDate").value=date; renderJobs();
 };
