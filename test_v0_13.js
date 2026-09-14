@@ -602,6 +602,63 @@ t("T18-4 24hを超えるセグメントは救済対象外", () => {
   eq(mt, null, "翌日25時間後は拾わない");
 });
 
+t("T18-5 2パス目は他系の孤児を読み飛ばし、最初の E[0] から消費する（v0.13.2 修正点）", () => {
+  // d系の実態: 石膏(11/12/16)とCAD/CAM(50/51/52)が同じ日に混在する。
+  // 救済範囲の先頭に別系統の孤児が残っていても、その先の自分のセグメントに届くこと。
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[], segments:[
+    seg("d1",3,"12:15:00","12:18:00"),                                          // 前ジョブの取りこぼし(16)＝他系の孤児
+    seg("d1",8,"12:20:00","12:33:00"), seg("d1",9,"12:34:00","12:36:00"), seg("d1",10,"12:37:00","12:40:00")
+  ]};
+  const j = job("cr","1213",CROWN);
+  eq(A.matchSegments(db, j, "2026-09-07", null, {mode:"rescue", segments:db.segments}) && true, true, "救済できる");
+  const mt = A.matchSegments(db, j, "2026-09-07", null, {mode:"rescue", segments:db.segments});
+  eq(barsOf(mt), CROWN);
+  eq(mt.picked[0].a, "2026-09-07T12:20:00", "12:15 の 16 を読み飛ばして 50 から始まる");
+});
+t("T18-6 読み飛ばした孤児は消費済みにならない", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[], segments:[
+    seg("d1",3,"12:15:00","12:18:00"),
+    seg("d1",8,"12:20:00","12:33:00"), seg("d1",9,"12:34:00","12:36:00"), seg("d1",10,"12:37:00","12:40:00")
+  ]};
+  const mt = A.matchSegments(db, job("cr","1213",CROWN), "2026-09-07", null, {mode:"rescue", segments:db.segments});
+  ok(!mt.consumedKeys.includes("d1|2026-09-07T12:15:00"), "孤児は他のジョブの救済に残る");
+  eq(mt.consumedKeys.length, 3);
+});
+t("T18-7 1パス目の打ち切りは変わらない（読み飛ばしが漏れていない）", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[], segments:[
+    seg("d1",3,"12:15:00","12:18:00"),
+    seg("d1",8,"12:20:00","12:33:00"), seg("d1",9,"12:34:00","12:36:00"), seg("d1",10,"12:37:00","12:40:00")
+  ]};
+  eq(A.matchSegments(db, job("cr","1213",CROWN), "2026-09-07", null), null,
+     "1パス目は期待外(16)で打ち切り＝別ジョブが始まっているとみなす");
+});
+t("T18-8 読み飛ばした後も順序ルールは同じ（崩れたら打ち切り）", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[], segments:[
+    seg("d1",3,"12:15:00","12:18:00"),                     // 他系の孤児
+    seg("d1",8,"12:20:00","12:33:00"),                     // 50
+    seg("d1",10,"12:34:00","12:36:00"),                    // 52（順序違い）
+    seg("d1",9,"12:37:00","12:40:00")                      // 51
+  ]};
+  const mt = A.matchSegments(db, job("cr","1213",CROWN), "2026-09-07", null, {mode:"rescue", segments:db.segments});
+  eq(barsOf(mt), [50], "50 の次が 52 なので打ち切り");
+});
+t("T18-9 混在日の2ジョブが1パス目で共倒れしても、2パス目で両方拾える", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], segments:[
+    seg("d1",3,"12:15:00","12:18:00"),
+    seg("d1",8,"12:20:00","12:33:00"), seg("d1",9,"12:34:00","12:36:00"), seg("d1",10,"12:37:00","12:40:00"),
+    seg("d1",1,"13:00:00","13:33:00"), seg("d1",2,"13:34:00","13:56:00"), seg("d1",3,"13:57:00","13:59:00")
+  ], jobs:[
+    {id:"j_br", date:"2026-09-07", hhmm:"1209", machine:"d1", kind:"Br", units:3, expectedBars:STONE},
+    {id:"j_cr", date:"2026-09-07", hhmm:"1213", machine:"d1", kind:"Cr", expectedBars:CROWN}
+  ]};
+  const {res} = runTwoPass(db, db.jobs);
+  ok(res["j_br"].rescued && res["j_cr"].rescued, "両方とも2パス目で拾われる");
+  eq(barsOf(res["j_br"].mt), STONE);
+  eq(barsOf(res["j_cr"].mt), CROWN);
+  eq(res["j_cr"].mt.picked[0].a, "2026-09-07T12:20:00", "冠は自分の12:20群");
+  eq(res["j_br"].mt.picked[0].a, "2026-09-07T13:00:00", "ブリッジは13:00群");
+});
+
 console.log("\n=== T19: 尻尾許容（2026-08-19 w2 long_inside） ===");
 // w2 スロット s16=66 s17=67 s18=69（物理と一致＝v0.11のw2補正は発動しない）
 const W2_SNAP = {id:"s_w2", machine:"w2", takenAt:"2026-08-20T09:00",
