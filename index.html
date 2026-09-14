@@ -69,7 +69,7 @@
 
 <header>
   <h1>Tool<span>Ltm</span></h1>
-  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.12</div>
+  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.13.1</div>
 </header>
 
 <h2>0. USBフォルダ一括取り込み</h2>
@@ -173,6 +173,7 @@
   <div class="btnrow">
     <button id="btnCsvDiff">差分表をCSV出力</button>
     <button id="btnCsvEx">交換履歴をCSV出力</button>
+    <button id="btnCsvJobs">加工記録をCSV出力</button>
     <button id="btnBackup">全データをJSONバックアップ</button>
     <button id="btnRestore">JSONから復元</button>
     <input type="file" id="fileRestore" accept=".json" style="display:none">
@@ -188,18 +189,57 @@
 
 <script>
 "use strict";
+// ---------- 変更履歴 ----------
+// v0.13.1 (2026-09-10)
+//  ⑦ 加工記録のCSV出力（jobsCsv / btnCsvJobs）。25列・1行1ジョブ。Excelピボットで日付×種別の件数/歯数/ユ数/機械時間を出すため
+//     2パス突合を computeJobMatches に切り出し、画面(renderJobs)とCSVで同一の結果を使う（二重実装の禁止）
+//     renderJobs は突合を db.jobs 全件で回してから絞り込んで描画する。画面のフィルタが突合結果を変えないようにするため
+// v0.13 (2026-09-08)
+//  ① 取込: 同一マシンのMeasureログは最新1本のみ処理（追記型なので古いコピーは部分集合）。スキップはマシンごとに1行集約
+//  ② 取込の進捗表示（処理中… INI n/N ／ Measure m/M）と btnDir の二重起動防止・完了行・所要秒
+//  ③ SEG_EPOCH固定を廃止し SEG_KEEP_DAYS=60 のローリング保持へ（loadDB・取込間引き・加工記録表示を統一）。取込完了ログに保存領域の使用量を出す
+//  ④ バー交換理由（固定選択肢）とメモを db.exchanges に記録。交換CSVに 理由,メモ の2列を追加
+//  ⑤ 突合を集合型から順序型へ。1パス目=順次消費（先頭の同系孤児は飛ばす）＋尻尾許容(E[1]かつ≤10分)、2パス目=未消費セグメントからの孤児救済
+//     期待バー不明のジョブだけは v0.12 の貪欲消費を維持（カーソルを止めないため）。表示に「(推定)」を付ける
+//  ⑥ KINDのincludesフォールバックを石支台のみに限定（"Inside"のIn誤検出対策）／templateNameに long_inside を追加
 const LSKEY = "toolltm.v1";
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;");
 
 // ---------- storage ----------
-const SEG_EPOCH = "2026-07-01"; // v0.12 間引き: これより古いセグメントは保持しない(ジョブ突合対象は2026-07以降。d系10年分の流入でlocalStorage 5MB上限を突いた対策)
+// v0.13③ ローリング保持: 固定エポック(v0.12の2026-07-01)は蓄積で再び5MB上限に当たるため、
+// 「今日から SEG_KEEP_DAYS 日前まで」の窓に変更する。バー寿命は交換履歴(finalRun)とINIのRunTimeから出るので古いセグメントは落として構わない。
+const SEG_KEEP_DAYS = 60;
+// localStorage の使用量表示。ブラウザはキー＋値をUTF-16のコードユニットで数えるため char数×2 バイトで見積もる。
+// （UTF-8バイト数で数えるより保守的＝早めに警告が出る側。実測とズレたら LS_LIMIT_MB を調整すること）
+const LS_LIMIT_MB = 5.0;
+function lsUsageBytes(){
+  let n = 0;
+  for(let i=0;i<localStorage.length;i++){
+    const k = localStorage.key(i);
+    n += (k.length + (localStorage.getItem(k) || "").length) * 2;
+  }
+  return n;
+}
+function lsUsageLine(){
+  const mb = lsUsageBytes() / 1048576;
+  return `保存領域 ${mb.toFixed(1)} / ${LS_LIMIT_MB.toFixed(1)} MB`;
+}
+function segCutoff(now){
+  const d = now ? new Date(now.getTime()) : new Date();
+  d.setDate(d.getDate() - SEG_KEEP_DAYS);                 // ローカル暦で日数を引く
+  d.setMinutes(d.getMinutes() - d.getTimezoneOffset());   // toISOString がローカル日付を返すようずらす
+  return d.toISOString().slice(0,10);
+}
+// セグメントを保持するか（loadDBの filter と 取込の間引き判定を1本化）
+function isSegKept(a, cut){ return a >= (cut || segCutoff()); }
 function loadDB(){
   try{
     const d = JSON.parse(localStorage.getItem(LSKEY)) || {};
     const db = {snapshots:d.snapshots||[], exchanges:d.exchanges||[], segments:d.segments||[], jobs:d.jobs||[]};
     for(const s of db.snapshots) fixW2Types(s.machine, s.tools);   // v0.11 w2個体差補正（過去分も読み替え）
-    db.segments = db.segments.filter(s => s.a >= SEG_EPOCH);         // v0.12 間引き（保存時に反映され容量が空く）
+    const cut = segCutoff();
+    db.segments = db.segments.filter(s => isSegKept(s.a, cut));      // v0.13③ ローリング保持（保存時に反映され容量が空く）
     return db;
   }
   catch(e){ return {snapshots:[], exchanges:[], segments:[], jobs:[]}; }
@@ -354,8 +394,12 @@ function parseNoteLine(line){
     .replace(/＃/g, "#");
   const r = { note: s };
   const mc = s.match(/\b(d1|d2|w1|w2)\b/i); if(mc) r.machine = mc[1].toLowerCase();
-  // 種別
-  for(const k of Object.keys(KIND)){ if(new RegExp("\\b"+k+"\\b").test(s) || s.includes(k)){ r.kind = k; break; } }
+  // 種別。v0.13⑥: ASCIIキー(Cr/In/On/Br/Con)は\b一致のみ。includesフォールバックは石支台だけに限定する
+  //（"C(long_inside)" の "Inside" が includes("In") に食いつきインレー誤検出していた）
+  for(const k of Object.keys(KIND)){
+    const hit = /^[A-Za-z]+$/.test(k) ? new RegExp("\\b"+k+"\\b").test(s) : s.includes(k);
+    if(hit){ r.kind = k; break; }
+  }
   // 材料（テンプレ抽出より先に確定させる: 単独A/B/CのフォールバックをMetal系限定にするため）
   const mat = s.match(/\b(TiA|TiP|Stone|WAX|PMMA|PEEK|HR)\b/i); if(mat) r.material = mat[1];
   // CAD注記（第2信号）: "CAD Cr" 等 → CAD/CAM冠確定。PEEKが明記されていればそちら優先
@@ -381,7 +425,9 @@ function parseNoteLine(line){
   const bs = s2.match(/(?:^|\s)(\d{2}(?:XLL|XL|L)?)(?=\s|$)/);
   if(bs) r.blockSize = bs[1];
   // テンプレート名（insurance_v2 等）: 文字列として保持するだけ。辞書は持たない
-  const tn = s.match(/\b([A-Za-z]+_v\d+)\b/) || s.match(/\b(insurance\w*)\b/i) || s.match(/\b(Slow)\b/i);
+  // v0.13⑥: long_inside を追加（歯冠長が長い症例のテンプレ。内面の最終加工だけ2mmバーになる＝尻尾セグメントの目印）
+  const tn = s.match(/\b([A-Za-z]+_v\d+)\b/) || s.match(/\b(insurance\w*)\b/i)
+          || s.match(/\b(long_inside)\b/i) || s.match(/\b(Slow)\b/i);
   if(tn) r.templateName = tn[1];
   return r;
 }
@@ -397,7 +443,10 @@ function expectedBars(material, template){
 }
 // E. ユニット内訳の補完
 function fillUnits(j){
-  if(j.kind==="Con"){ if(j.units==null) j.units=j.abut??2; j.pontic=0; if(j.abut==null)j.abut=j.units; }
+  // Con: 全Nが無ければ支Nから導出する。支Nも無ければ null のまま残す。
+  // v0.13.1: 以前はここで 2 を既定値にしていたが、原文に無い歯数が黙って作られ、
+  // 「全N欠」フラグも発火しないまま集計に混ざるため、リテラルのフォールバックは廃止した。
+  if(j.kind==="Con"){ if(j.units==null) j.units=j.abut; j.pontic=0; if(j.abut==null)j.abut=j.units; }
   // Br: 内訳(支台/ポン)は使い道未定のため要求しない（v0.8, 案A）。
   // 注記に書かれていれば上のパーサー(r.abut/r.pontic)が機会的に拾う。歯番はj.teethに保持済み。
   return j;
@@ -441,37 +490,88 @@ function parseJobLog(text){
   }
   return jobs;
 }
-// 突合: ジョブのHHMM以降で、期待バーに一致するセグメントを拾いバー別実消費を出す
-function matchSegments(db, job, dateStr, startFloor){
+// v0.13⑤ 突合: 期待バーを「順序付き配列 E（荒→中→仕上）」として順次消費する。
+// v0.12 は Set の一巡判定だったため、前ジョブの孤児セグメント（例: 仕上げバー16）が窓の先頭にあると
+// 自分のものとして食い、1件ズレが後続ジョブへ連鎖していた。
+// mode: "seq"  = 1パス目（カーソル付き順次消費。先頭の同系孤児は飛ばす）
+//       "rescue" = 2パス目（NC時刻以降24hの未消費セグメントから拾い直す孤児救済）
+const SEG_TAIL_MAX = 10 * 60;      // 尻尾（long_inside の内面仕上げ）とみなす保持時間の上限=10分
+const MERGE_GAP = 120000;          // v0.12 隣接同一スロット統合（校正等の再測定で細切れになる分を1本に均す）
+const PARKJ = 12 * 3600 * 1000;    // v0.11 12h超の保持は装着放置・電源断とみなし消費に数えない
+function matchSegments(db, job, dateStr, startFloor, opts){
   if(!job.hhmm || !job.machine) return null;
-  // NC出力時刻を下限とするが、直前ジョブが消費し終えた時刻(カーソル)があればそちらを優先（v0.10 順次消費）
+  const E = job.expectedBars || [];
+  const greedy = !E.length;                        // 期待バー不明（材料不明ジョブ）は v0.12 の貪欲消費に落とす
+  const mode = (opts && opts.mode) || "seq";
+  const pool = (opts && opts.segments) || db.segments;
   const base = dateStr + "T" + job.hhmm.slice(0,2) + ":" + job.hhmm.slice(2,4);
-  const start = (startFloor && startFloor > base) ? startFloor : base;
-  const segs = db.segments
-    .filter(s => s.machine===job.machine && s.a >= start)
-    .sort((a,b)=> a.a<b.a?-1:1);
-  // 期待バーのセットが一巡するまでを1加工物ぶんとみなす（荒→中→仕上で各1回想定）
-  const want = new Set(job.expectedBars||[]);
-  // v0.12 隣接同一スロット統合: 校正等の再測定で「装着→装着」が連続し細切れになる分を1本に均してから突合
-  const MERGE_GAP = 120000;
+
+  let segs;
+  if(mode === "rescue"){
+    // 探索範囲はNC時刻直後〜24h。カーソルは使わない（NC順と加工順が入れ替わった分を拾うため）
+    const hi = msToLocalIso(Date.parse(base) + 24*3600*1000);
+    segs = pool.filter(s => s.machine===job.machine && s.a > base && s.a < hi);
+  }else{
+    // NC出力時刻を下限とするが、直前ジョブが消費し終えた時刻(カーソル)があればそちらを優先（v0.10 順次消費）
+    const start = (startFloor && startFloor > base) ? startFloor : base;
+    segs = pool.filter(s => s.machine===job.machine && s.a >= start);
+  }
+  segs = segs.slice().sort((a,b)=> a.a<b.a?-1:1);
+
   const mseg = [];
   for(const s of segs){
     const p = mseg[mseg.length-1];
-    if(p && p.slot===s.slot && Date.parse(s.a) - Date.parse(p.b) <= MERGE_GAP){ p.b = s.b; }
-    else mseg.push({slot:s.slot, a:s.a, b:s.b});
+    if(p && p.slot===s.slot && Date.parse(s.a) - Date.parse(p.b) <= MERGE_GAP){ p.b = s.b; p.src.push(s.a); }
+    else mseg.push({slot:s.slot, a:s.a, b:s.b, src:[s.a]});
   }
-  const used = {}; const picked=[]; const seen=new Set();
-  const PARKJ = 12 * 3600 * 1000;  // v0.11: 稼働セグメント画面と同じ12h跨ぎ除外（装着放置・電源断は消費に数えない）
-  for(const s of mseg){
-    if(Date.parse(s.b) - Date.parse(s.a) > PARKJ) continue;  // 放置は拾わず・打ち切りもしない
-    const bar = barOf(db, job.machine, s.slot, s.b);
-    if(bar==null) continue;
-    if(want.size && !want.has(bar)) break;       // 期待外のバーが来たら次ジョブに入ったとみなす
-    if(seen.has(bar)) break;                       // 同じバーが再登場＝次のワーク
+
+  const used = {}, picked = [];
+  const take = (s, bar, isTail) => {
     const dur = Math.round((Date.parse(s.b)-Date.parse(s.a))/1000);
-    used[bar]=(used[bar]||0)+dur; picked.push({bar,dur,a:s.a,b:s.b}); seen.add(bar);
+    used[bar] = (used[bar]||0) + dur;
+    picked.push(isTail ? {bar, dur, a:s.a, b:s.b, src:s.src, tail:true} : {bar, dur, a:s.a, b:s.b, src:s.src});
+  };
+  const barAt = s => barOf(db, job.machine, s.slot, s.b);
+
+  let k = 0;                                        // 次に期待するインデックス
+  const seen = new Set();                           // 貪欲モード用（同じバーの再登場＝次のワーク）
+  for(let i=0;i<mseg.length;i++){
+    const s = mseg[i];
+    if(Date.parse(s.b) - Date.parse(s.a) > PARKJ) continue;   // 放置は拾わず・打ち切りもしない
+    const bar = barAt(s);
+    if(bar == null) continue;
+    if(greedy){
+      // v0.12 互換: 期待列が無いので順序を見ず、同じバーが再登場するまで拾う。
+      // 順序型に乗らないのは承知の上で、カーソルを前進させ後続ジョブが全部2パス目送りになるのを避ける。
+      if(seen.has(bar)) break;
+      take(s, bar); seen.add(bar); continue;
+    }
+    if(k === 0){
+      if(bar === E[0]){ take(s, bar); k = 1; continue; }
+      if(E.includes(bar)) continue;                 // 同系の孤児（前ジョブの残り）は飛ばす
+      break;                                        // 期待外＝別ジョブが始まっている
+    }
+    if(bar !== E[k]) break;                         // 順序違い・再登場・期待外はすべて打ち切り
+    take(s, bar); k++;
+    if(k === E.length){
+      // 尻尾許容: 一巡完了直後の1本に限り、E[1]（そのテンプレの2mmバー）かつ保持時間≤10分なら追加で消費する
+      const nx = mseg[i+1];
+      if(nx){
+        const nb = barAt(nx);
+        const ndur = Math.round((Date.parse(nx.b)-Date.parse(nx.a))/1000);
+        if(nb === E[1] && ndur <= SEG_TAIL_MAX) take(nx, nb, true);
+      }
+      break;
+    }
   }
-  return picked.length? {used, picked, lastEnd: picked[picked.length-1].b} : null;
+  if(!picked.length) return null;
+  return {
+    used, picked,
+    estimated: greedy,                              // 表示側で「(推定)」を付けるための印
+    tail: picked.some(p => p.tail),
+    lastEnd: picked[picked.length-1].b,
+    consumedKeys: picked.flatMap(p => p.src.map(a => job.machine + "|" + a))
+  };
 }
 
 // ---------- diff ----------
@@ -553,17 +653,40 @@ function renderDiff(){
   area.innerHTML = html;
 }
 
+// v0.13④ 交換理由（固定選択肢）。既存レコードは reason/memo が undefined ＝未記入扱い
+const EX_REASONS = ["段取り","寿命(切削面)","脱落","折損","異音","傷(品質)","その他"];
+function setExReason(id, v){
+  const db = loadDB();
+  const e = db.exchanges.find(x => x.id === id);
+  if(!e) return;
+  e.reason = v || null;
+  saveDB(db);                       // 再描画しない（selectの表示値がそのまま正）
+}
+function editExMemo(id){
+  const db = loadDB();
+  const e = db.exchanges.find(x => x.id === id);
+  if(!e) return;
+  const v = prompt("交換メモ（自由記述。加工物・症状など）", e.memo || "");
+  if(v == null) return;             // キャンセル
+  e.memo = v.trim() ? v.trim() : null;
+  saveDB(db); renderExchanges();
+}
 function renderExchanges(){
   const db = loadDB();
   const area = $("exchangeArea");
   if(!db.exchanges.length){ area.className="empty"; area.textContent="まだ交換イベントの記録なし。"; return; }
-  let html = `<table><thead><tr><th>検知日</th><th>マシン</th><th>バー</th><th>生涯RunTime</th><th>交換時Cutting累計</th><th>前回観測</th><th></th></tr></thead><tbody>`;
+  let html = `<table><thead><tr><th>検知日</th><th>マシン</th><th>バー</th><th>生涯RunTime</th><th>交換時Cutting累計</th><th>理由</th><th>前回観測</th><th></th></tr></thead><tbody>`;
   for(const e of [...db.exchanges].sort((a,b)=>a.detectedAt<b.detectedAt?1:-1)){
+    const sel = `<select style="padding:2px 6px;font-size:12px" onchange="setExReason('${e.id}',this.value)">`
+      + `<option value=""${e.reason?"":" selected"}></option>`
+      + EX_REASONS.map(r=>`<option value="${r}"${e.reason===r?" selected":""}>${r}</option>`).join("")
+      + `</select>`;
     html += `<tr><td>${e.detectedAt.replace("T"," ")}</td><td>${e.machine}</td><td><b>${e.type}</b></td>
-      <td>${secToHms(e.finalRun)}${e.finalRunEdited?' <span class="tag info">手入力</span>':''}</td><td>${secToHms(e.cutAtExchange)}</td><td>${e.prevTakenAt.replace("T"," ")}</td>
-      <td><button class="ghost" style="padding:2px 8px;font-size:11px" onclick="editExchange('${e.id}')">編集</button> <button class="ghost" style="padding:2px 8px;font-size:11px" onclick="delExchange('${e.id}')">削除</button></td></tr>`;
+      <td>${secToHms(e.finalRun)}${e.finalRunEdited?' <span class="tag info">手入力</span>':''}</td><td>${secToHms(e.cutAtExchange)}</td>
+      <td>${sel}${e.memo?' <span title="'+esc(e.memo)+'">📝</span>':''}</td><td>${e.prevTakenAt.replace("T"," ")}</td>
+      <td><button class="ghost" style="padding:2px 8px;font-size:11px" onclick="editExMemo('${e.id}')">メモ</button> <button class="ghost" style="padding:2px 8px;font-size:11px" onclick="editExchange('${e.id}')">編集</button> <button class="ghost" style="padding:2px 8px;font-size:11px" onclick="delExchange('${e.id}')">削除</button></td></tr>`;
   }
-  html += "</tbody></table><div class='msg'>「生涯RunTime」は前回スナップショット時点の値。前回取得〜交換の間に加工があった分は含まれない（＝下限値）。厳密値が要る場合は交換直前にもコピーを取ること。「手入力」バッジは機械画面のメモ/写真値で補正済みの行。</div>";
+  html += "</tbody></table><div class='msg'>「生涯RunTime」は前回スナップショット時点の値。前回取得〜交換の間に加工があった分は含まれない（＝下限値）。厳密値が要る場合は交換直前にもコピーを取ること。「手入力」バッジは機械画面のメモ/写真値で補正済みの行。「理由」は後から埋める運用でよい（交換検知時に入力を強制しない）。</div>";
   area.className = "";
   area.innerHTML = html;
 }
@@ -688,14 +811,91 @@ $("btnCsvDiff").onclick = () => {
   }
   download(`toolltm_diff_${pending.machine}_${pending.takenAt.replace(/[:T]/g,"")}.csv`, csv, "text/csv");
 };
+// CSVセル: カンマ・改行・ダブルクォートを含む値はクォートして埋め込む
+function csvCell(v){
+  const s = String(v ?? "");
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+}
+// v0.13④ 末尾に 理由,メモ の2列を追加
+function exchangesCsv(exchanges){
+  let csv = "\uFEFF検知日時,マシン,バー,生涯RunTime秒,生涯RunTime,交換時Cutting累計,前回観測,手入力補正,理由,メモ\n";
+  for(const e of exchanges){
+    csv += [e.detectedAt, e.machine, e.type, e.finalRun, secToHms(e.finalRun), secToHms(e.cutAtExchange),
+            e.prevTakenAt, e.finalRunEdited?1:0, csvCell(e.reason ?? ""), csvCell(e.memo ?? "")].join(",") + "\n";
+  }
+  return csv;
+}
+// v0.13.1⑦ 歯数(算出)。ToolLtm の中で歯数を持つ唯一の場所。可視化・日次報告もこの定義に揃える。
+//  1. 注記に 全N があればその値（Br/Con、または全Nを明記した支台）
+//  2. なければ種別で決める: クラウン/インレー/アンレー = 1、石膏支台 = 1、連結冠は fillUnits 済みで 1 に落ちない
+//  3. どちらも取れなければ空（Br/Con で全N の書き漏れ）。この行は状態列に「全N欠」が付くので、CSV上で絞り込んで注記を直す
+function jobTeethCount(j){
+  if(j.units != null) return j.units;
+  if(j.kind === "Cr" || j.kind === "In" || j.kind === "On" || j.kind === "石支台") return 1;
+  return "";
+}
+// v0.13.1⑦ 加工記録CSV。1行1ジョブ・25列。集計はExcelのピボット側で行う（アプリ内に集計画面は作らない）。
+function jobsCsv(db){
+  const list = db.jobs.slice().sort(byDateTime);
+  const res = computeJobMatches(db, list);
+  const head = ["日付","時刻","マシン","種別","材料","厚み","テンプレ","テンプレ名","歯式",
+                "全","支台","ポン","前","ユ","期待バー","実消費(バー別)",
+                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)"];
+  let csv = "\uFEFF" + head.join(",") + "\n";
+  for(const j of list){
+    const r = res[j.id] || {};
+    const mt = r.mt;
+    const E = j.expectedBars || [];
+    const tags = [];
+    if(r.outOfRange) tags.push("保持期間外");
+    else if(!mt) tags.push("未突合");
+    else{
+      if(r.rescued) tags.push("救済");
+      if(mt.estimated) tags.push("推定");
+      if(mt.tail) tags.push("尻尾");
+      if(!tags.length) tags.push("ok");
+    }
+    // v0.13.1 全N欠: Br/Con で全Nが無いと歯数(算出)が空になり、Excelの合計から黙って抜ける。
+    // 状態列でフィルタして注記を直すための目印（突合の成否とは独立なので、どの状態にも付く）。
+    if((j.kind === "Br" || j.kind === "Con") && j.units == null) tags.push("全N欠");
+    // 役割列: バー番号ではなく期待バーの「位置」で決まる（11/12/16 と 50/51/52 が同じ列に入る）。
+    // 役割2秒は matchSegments が尻尾を同バーに合算済みなので、尻尾ぶんを含む。
+    const role = i => (mt && E[i] != null && mt.used[E[i]] != null) ? mt.used[E[i]] : "";
+    const tailSec = mt ? mt.picked.filter(p => p.tail).reduce((n,p) => n + p.dur, 0) : "";
+    const totalSec = mt ? Object.values(mt.used).reduce((n,v) => n + v, 0) : "";
+    csv += [
+      j.date || "",
+      j.hhmm ? j.hhmm.slice(0,2) + ":" + j.hhmm.slice(2,4) : "",
+      j.machine || "",
+      csvCell(KIND[j.kind] ?? j.kind ?? ""),
+      csvCell(j.material ?? ""),
+      csvCell(j.thick ?? ""),
+      csvCell(j.template ?? ""),
+      csvCell(j.templateName ?? ""),
+      csvCell(j.teeth ?? ""),
+      j.units ?? "", j.abut ?? "", j.pontic ?? "", j.veneer ?? "", j.userdef ?? "",
+      E.join("/"),
+      mt ? Object.keys(mt.used).sort((a,b)=>a-b).map(b => `${b}=${mt.used[b]}`).join(";") : "",
+      role(0), role(1), role(2),
+      tailSec,
+      totalSec,
+      totalSec === "" ? "" : secToHms(totalSec),
+      tags.join("+"),
+      csvCell(j.note ?? ""),
+      jobTeethCount(j)
+    ].join(",") + "\n";
+  }
+  return csv;
+}
+$("btnCsvJobs").onclick = () => {
+  const db = loadDB();
+  if(!db.jobs.length){ $("dataMsg").textContent = "加工記録がまだ空。"; return; }
+  download("toolltm_jobs.csv", jobsCsv(db), "text/csv");
+};
 $("btnCsvEx").onclick = () => {
   const db = loadDB();
   if(!db.exchanges.length){ $("dataMsg").textContent = "交換履歴がまだ空。"; return; }
-  let csv = "\uFEFF検知日時,マシン,バー,生涯RunTime秒,生涯RunTime,交換時Cutting累計,前回観測,手入力補正\n";
-  for(const e of db.exchanges){
-    csv += [e.detectedAt, e.machine, e.type, e.finalRun, secToHms(e.finalRun), secToHms(e.cutAtExchange), e.prevTakenAt, e.finalRunEdited?1:0].join(",") + "\n";
-  }
-  download("toolltm_exchanges.csv", csv, "text/csv");
+  download("toolltm_exchanges.csv", exchangesCsv(db.exchanges), "text/csv");
 };
 $("btnBackup").onclick = () => {
   download("toolltm_backup_" + new Date().toISOString().slice(0,10) + ".json", localStorage.getItem(LSKEY) || "{}", "application/json");
@@ -740,57 +940,93 @@ async function readFileText(f){
   return text;
 }
 $("btnDir").onclick = () => $("dirPick").click();
+// v0.13① Measureログは追記型 → 古いコピーは最新コピーの部分集合。マシンごとに最新1本だけ処理する。
+// lastModified が同値なら size が大きい方を採用。
+function pickLatestPerMachine(files, machineOf){
+  const best = {}, skipped = {}, unknown = [];
+  for(const f of files){
+    const m = machineOf(f);
+    if(!m){ unknown.push(f); continue; }
+    const cur = best[m];
+    if(!cur){ best[m] = f; skipped[m] = 0; continue; }
+    const newer = f.lastModified > cur.lastModified ||
+                  (f.lastModified === cur.lastModified && (f.size||0) > (cur.size||0));
+    if(newer) best[m] = f;
+    skipped[m]++;
+  }
+  return { picked: Object.keys(best).sort().map(m => best[m]), skipped, unknown };
+}
 $("dirPick").onchange = async e => {
   const files = [...e.target.files];
+  const btn = $("btnDir");
+  const t0 = Date.now();
   const log = [];
-  // INIを更新日時の古い順に処理（差分の連鎖を正しく）
+  let progress = "";
+  const paint = () => {
+    const lines = progress ? [progress, ...log] : log;
+    $("dirLog").innerHTML = lines.map(l => l.replace(/&/g,"&amp;").replace(/</g,"&lt;")).join("<br>")
+      || "対象ファイルが見つからなかった。";
+  };
+  const breathe = () => new Promise(r => setTimeout(r, 0));   // v0.13② 描画機会を与える（これがないと進捗が見えない）
+
+  // INIは全本を更新日時の古い順に処理（差分の連鎖＝交換検知に必要）
   const inis = files.filter(f => /toolproperties\.ini$/i.test(f.name))
                     .sort((a,b) => a.lastModified - b.lastModified);
-  const logs = files.filter(f => /measuretoolrefposz/i.test(f.name));
-  for(const f of inis){
+  const sel = pickLatestPerMachine(
+    files.filter(f => /measuretoolrefposz/i.test(f.name)),
+    f => machineFromPath(f.webkitRelativePath));
+  const logs = sel.picked;
+
+  let iniDone = 0, segDone = 0;
+  const upd = () => { progress = `処理中… INI ${iniDone}/${inis.length} ／ Measure ${segDone}/${logs.length}`; paint(); };
+
+  async function handleIni(f){
     const machine = machineFromPath(f.webkitRelativePath);
-    if(!machine){ log.push(`スキップ: ${f.webkitRelativePath}（d1/d2/w1/w2のフォルダ配下にない）`); continue; }
+    if(!machine){ log.push(`スキップ: ${f.webkitRelativePath}（d1/d2/w1/w2のフォルダ配下にない）`); return; }
     const takenAt = msToLocalIso(f.lastModified); // 更新日時＝最後の加工時刻
     const db = loadDB();
     const dup = db.snapshots.find(s => s.machine === machine &&
       Math.abs(Date.parse(s.takenAt) - Date.parse(takenAt)) < 120000);
-    if(dup){ log.push(`スキップ: ${machine} INI（同時刻のスナップショット登録済み）`); continue; }
+    if(dup){ log.push(`スキップ: ${machine} INI（同時刻のスナップショット登録済み）`); return; }
     try{
-    const {tools} = parseIni(await readFileText(f));
-    fixW2Types(machine, tools);   // v0.11 w2個体差補正（保存前に読み替え）
-    if(!tools.length){ log.push(`スキップ: ${machine} INI（有効工具0本）`); continue; }
-    const prev = latestSnapshot(db, machine, takenAt);
-    if(prev){
-      const prevSet = new Set(prev.tools.map(t => t.type));
-      const overlap = tools.filter(t => prevSet.has(t.type)).length;
-      const ratio = overlap / Math.max(tools.length, prevSet.size);
-      if(ratio < 0.5 && !confirm(
-        `${machine} のINIとして登録しようとしているが、前回スナップショットとバー構成が大きく違う（一致${overlap}本）。\nマシン取り違えの可能性あり。本当に ${machine} として登録する？`)){
-        log.push(`中止: ${machine} INI（バー構成不一致 → 取り違えの疑いで登録せず）`);
-        continue;
+      const {tools} = parseIni(await readFileText(f));
+      fixW2Types(machine, tools);   // v0.11 w2個体差補正（保存前に読み替え）
+      if(!tools.length){ log.push(`スキップ: ${machine} INI（有効工具0本）`); return; }
+      const prev = latestSnapshot(db, machine, takenAt);
+      if(prev){
+        const prevSet = new Set(prev.tools.map(t => t.type));
+        const overlap = tools.filter(t => prevSet.has(t.type)).length;
+        const ratio = overlap / Math.max(tools.length, prevSet.size);
+        if(ratio < 0.5 && !confirm(
+          `${machine} のINIとして登録しようとしているが、前回スナップショットとバー構成が大きく違う（一致${overlap}本）。\nマシン取り違えの可能性あり。本当に ${machine} として登録する？`)){
+          log.push(`中止: ${machine} INI（バー構成不一致 → 取り違えの疑いで登録せず）`);
+          return;
+        }
       }
-    }
-    const diff = buildDiff({tools}, prev);
-    const ex = commitSnapshot(machine, takenAt, tools, prev, diff);
-    log.push(`登録: ${machine} スナップショット ${takenAt.replace("T"," ")}（${tools.length}本${ex ? "、交換検知"+ex+"件" : ""}）`);
+      const diff = buildDiff({tools}, prev);
+      const ex = commitSnapshot(machine, takenAt, tools, prev, diff);
+      log.push(`登録: ${machine} スナップショット ${takenAt.replace("T"," ")}（${tools.length}本${ex ? "、交換検知"+ex+"件" : ""}）`);
     }catch(err){ log.push(`エラー: ${machine} INI処理失敗（${err.name}: ${err.message}）`); }
   }
-  for(const f of logs){
+
+  async function handleMeasure(f){
     const machine = machineFromPath(f.webkitRelativePath);
-    if(!machine){ log.push(`スキップ: ${f.webkitRelativePath}（マシン判定不可）`); continue; }
+    if(!machine){ log.push(`スキップ: ${f.webkitRelativePath}（マシン判定不可）`); return; }
     try{
       const segs = parseMeasure(await readFileText(f));
       const db = loadDB();
+      const cut = segCutoff();
       const known = new Set(db.segments.filter(s => s.machine === machine).map(s => s.a));
       let added = 0, old = 0;
       for(const s of segs){
-        if(s.a < SEG_EPOCH){ old++; continue; }   // v0.12 間引き: 古い履歴は取り込まない
+        if(!isSegKept(s.a, cut)){ old++; continue; }   // v0.13③ ローリング保持
         if(known.has(s.a)) continue;
         db.segments.push({machine, slot:s.slot, a:s.a, b:s.b, broken:!!s.broken});
+        known.add(s.a);
         added++;
       }
       saveDB(db);
-      log.push(`取込: ${machine} Measureログ（新規セグメント${added}件 / 全${segs.length}件${old?`、${SEG_EPOCH}以前の${old}件は間引き`:""}）`);
+      log.push(`取込: ${machine} Measureログ（新規セグメント${added}件 / 全${segs.length}件${old?`、${cut}以前の${old}件は保持期間外`:""}）`);
       if(added){
         $("segMachine").value = machine;
         $("segDate").value = db.segments.filter(s=>s.machine===machine).map(s=>s.a).sort().pop().slice(0,10);
@@ -799,9 +1035,30 @@ $("dirPick").onchange = async e => {
       log.push(`エラー: ${machine} Measureログ処理失敗（${err.name}: ${err.message}）`);   // v0.12 無言死の禁止
     }
   }
-  $("dirLog").innerHTML = log.map(l => l.replace(/&/g,"&amp;").replace(/</g,"&lt;")).join("<br>") || "対象ファイルが見つからなかった。";
+
+  btn.disabled = true;   // v0.13② 二重起動防止
+  try{
+    for(const f of sel.unknown) log.push(`スキップ: ${f.webkitRelativePath}（マシン判定不可）`);
+    for(const m of Object.keys(sel.skipped).sort()){
+      const n = sel.skipped[m];
+      if(n) log.push(`スキップ: ${m} Measureログ ${n}本（古いコピー。最新1本のみ処理）`);
+    }
+    upd();
+    for(const f of inis){ await handleIni(f); iniDone++; upd(); await breathe(); }
+    for(const f of logs){ await handleMeasure(f); segDone++; upd(); await breathe(); }
+    progress = "";
+    log.push(`完了: INI ${iniDone}件処理 ／ Measure ${segDone}件処理 ／ 所要 ${((Date.now()-t0)/1000).toFixed(1)}秒`);
+    log.push(lsUsageLine());
+    paint();
+  }catch(err){
+    progress = "";
+    log.push(`エラー: 取込が中断（${err.name}: ${err.message}）`);
+    paint();
+  }finally{
+    btn.disabled = false;
+    e.target.value = "";
+  }
   renderExchanges(); renderSnapList(); renderSegs();
-  e.target.value = "";
 };
 
 // ---------- segments view ----------
@@ -898,20 +1155,52 @@ $("btnJobSave").onclick = () => {
 };
 $("btnJobClear").onclick = () => { $("jobInput").value=""; pendingJobs=null; $("btnJobSave").disabled=true; $("jobParseMsg").textContent=""; $("jobPreview").innerHTML=""; };
 
+// v0.13.1⑦ 2パス突合を関数化。renderJobs と jobsCsv がこれを共有する（画面とCSVで結果が食い違わないようにするため）。
+// list は (date+hhmm) 昇順であること。戻り値は {jobId: {mt, rescued, outOfRange}}。
+function computeJobMatches(db, list){
+  const cut = segCutoff();
+  const cursors={}, consumed=new Set(), res={};
+  // 1パス目 = 順次消費（マシン別カーソルを持ち、突合できた分だけ前へ進める）
+  for(const j of list){
+    if(j.date < cut){ res[j.id]={outOfRange:true}; continue; }   // v0.13③ 保持期間外はnullと区別する
+    const mt=matchSegments(db,j,j.date,cursors[j.machine]??null);
+    if(mt){
+      cursors[j.machine]=mt.lastEnd;   // 不突合(null)のときは据え置き＝後続ジョブの窓を狭めない
+      for(const k of mt.consumedKeys) consumed.add(k);
+    }
+    res[j.id]={mt};
+  }
+  // 2パス目 = 1パス目でnullだったジョブを、未消費セグメントだけを対象に拾い直す（NC順≠加工順の救済）
+  for(const j of list){
+    const r=res[j.id];
+    if(r.outOfRange || r.mt) continue;
+    const avail=db.segments.filter(s => !consumed.has(s.machine+"|"+s.a));
+    const mt=matchSegments(db,j,j.date,null,{mode:"rescue", segments:avail});
+    if(mt){ r.mt=mt; r.rescued=true; for(const k of mt.consumedKeys) consumed.add(k); }
+  }
+  return res;
+}
+const byDateTime = (a,b) => (a.date+(a.hhmm||"")) < (b.date+(b.hhmm||"")) ? -1 : 1;
 function renderJobs(){
   const db=loadDB(); const m=$("jobViewMachine").value; const d=$("jobViewDate").value;
   const area=$("jobListArea");
-  const list=db.jobs.filter(j=>(!m||j.machine===m)&&(!d||j.date===d)).sort((a,b)=>(a.date+a.hhmm)<(b.date+b.hhmm)?-1:1);
+  // 突合は全件で回す。画面のフィルタで前日ぶんが落ちるとカーソルと未消費集合が変わり、
+  // 同じジョブの結果が絞り込み方によって変わってしまうため（CSVは常に全件なので、そこともズレる）。
+  const all=db.jobs.slice().sort(byDateTime);
+  const res=computeJobMatches(db, all);
+  const list=all.filter(j=>(!m||j.machine===m)&&(!d||j.date===d));
   if(!list.length){ area.className="empty"; area.textContent="該当なし。"; return; }
+  const cut = segCutoff();
   let html=`<table><thead><tr><th>日付</th><th>時刻</th><th>マシン</th><th>加工物</th><th>期待バー</th><th>実消費(セグメント突合)</th><th></th></tr></thead><tbody>`;
-  // 順次消費（v0.10）: listは既に(date+hhmm)昇順。マシン別カーソルを持ち、突合できた分だけ前へ進める
-  const cursors={};
   for(const j of list){
-    const mt=matchSegments(db,j,j.date,cursors[j.machine]??null);
+    const r=res[j.id];
     let real="—";
-    if(mt){
-      cursors[j.machine]=mt.lastEnd;   // 不突合(null)のときは据え置き＝後続ジョブの窓を狭めない
-      real=Object.keys(mt.used).sort((a,b)=>a-b).map(b=>`${b}=${secToHms(mt.used[b])}`).join(" / ");
+    if(r.outOfRange) real=`—<span style="color:var(--dim)">（保持期間外）</span>`;
+    else if(r.mt){
+      real=Object.keys(r.mt.used).sort((a,b)=>a-b).map(b=>`${b}=${secToHms(r.mt.used[b])}`).join(" / ");
+      if(r.mt.tail) real+=" (尻尾)";
+      if(r.mt.estimated) real+=" (推定)";
+      if(r.rescued) real+=' <span class="tag info">救済</span>';
     }
     html+=`<tr><td>${j.date}</td><td>${j.hhmm?j.hhmm.slice(0,2)+":"+j.hhmm.slice(2,4):"—"}</td><td>${j.machine||"?"}</td>
       <td style="text-align:left">${fmtUnits(j)||esc(j.note)||esc(j.raw)}</td>
@@ -919,7 +1208,7 @@ function renderJobs(){
       <td style="text-align:left">${real}</td>
       <td><button class="ghost" style="padding:2px 8px;font-size:11px" onclick="delJob('${j.id}')">削除</button></td></tr>`;
   }
-  html+="</tbody></table><div class='msg'>実消費は加工物のNC時刻以降・期待バーが一巡するまでのセグメントを合計。連続ネスト時は直前ジョブの消費終了以降から突合（v0.10順次消費）。段取り時間は含まない。セグメント未取込のマシンは「—」。</div>";
+  html+=`</tbody></table><div class='msg'>実消費は加工物のNC時刻以降、期待バーを<b>荒→中→仕上の順に</b>消費して一巡するまでの合計（v0.13順序型）。窓の先頭に残った同系の孤児は飛ばす。<span class="tag info">救済</span>はNC順と加工順が入れ替わったジョブを2パス目で拾い直したもの。「(尻尾)」はlong_insideの内面仕上げ(2mmバー・10分以内)を含む。「(推定)」は期待バー不明のジョブで、順序を見ずに同じバーの再登場までを拾ったもの。段取り時間は含まない。セグメント未取込のマシンは「—」、${cut} より前のジョブは「保持期間外」。</div>`;
   area.className=""; area.innerHTML=html;
 }
 function delJob(id){ if(!confirm("この加工物記録を削除する？"))return; const db=loadDB(); db.jobs=db.jobs.filter(j=>j.id!==id); saveDB(db); renderJobs(); }
