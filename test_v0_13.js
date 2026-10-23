@@ -24,6 +24,8 @@
 //   T27 加工記録CSV の列とエスケープ（v0.13.1）
 //   T28 画面とCSVが同じ突合結果を使う
 //   T29 役割列と尻尾秒
+//   T30 Zr と裂溝の期待バー（v0.13.3）  T31 テンプレ名の分離（Normal / Fissure）
+//   T32 認識語の一覧                  T33 交換履歴の表示制限
 //
 // 方式: index.html の <script> を切り出して vm 上で評価し、DOM と localStorage は
 //       最小スタブを当てる。ブラウザを立ち上げずに内部関数を直接叩ける。
@@ -81,6 +83,7 @@ function loadApp(){
     computeJobMatches, jobsCsv, jobTeethCount, byDateTime,
     lsUsageBytes, lsUsageLine, LS_LIMIT_MB,
     renderJobs, renderExchanges, setExReason,
+    MAT_TOKENS, TEMPLATE_TOKENS, FISSURE_TOKEN, renderJobTokens, setExView, exView, EX_DEFAULT_LIMIT, fmtUnits,
     SEG_TAIL_MAX, PARKJ, MERGE_GAP
   };`;
   vm.runInContext(m[1] + epilogue, ctx, {filename:"index.html:script"});
@@ -932,7 +935,7 @@ t("T23-5 setExReason は保存し、空選択で null に戻る", () => {
 console.log("\n=== T27: jobsCsv の列とエスケープ（v0.13.1） ===");
 const HEAD27 = ["日付","時刻","マシン","種別","材料","厚み","テンプレ","テンプレ名","歯式",
                 "全","支台","ポン","前","ユ","期待バー","実消費(バー別)",
-                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)"];
+                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)","裂溝"];
 function csvRows(csv){                       // クォート内の改行を潰さずに行へ割る素朴なパーサ
   const rows = []; let cur = [], f = "", q = false;
   for(let i=0;i<csv.length;i++){
@@ -950,7 +953,7 @@ function csvRows(csv){                       // クォート内の改行を潰�
   rows[0][0] = rows[0][0].replace(/^\uFEFF/, "");
   return rows;
 }
-t("T27-1 ヘッダが25列・指定の順で出る（BOM付き）", () => {
+t("T27-1 ヘッダが26列・指定の順で出る（BOM付き。v0.13.3 で列26「裂溝」を追加）", () => {
   const csv = A.jobsCsv({jobs:[], segments:[], snapshots:[], exchanges:[]});
   ok(csv.startsWith("\uFEFF"), "BOM");
   eq(csvRows(csv)[0], HEAD27);
@@ -1193,6 +1196,156 @@ t("T24-4 既存の templateName（insurance_v2 / Slow）は壊れない", () => 
 t("T24-5 long_inside ジョブでも expectedBars は C系のまま", () => {
   const r = A.parseNoteLine("w2 TiA Cr C(long_inside) #16 全1");
   eq(A.expectedBars(r.material, r.template), [66,67,69]);
+});
+
+console.log("\n=== T30: Zr と裂溝の期待バー（v0.13.3） ===");
+const ZR = [13,14,15], ZR_F = [13,14,33];
+const zrJob = (note, iso) => A.parseJobLog((iso || "C:\\NC Output_dry2\\261019_14L_d2_b1_20261019_1357.iso") + "\n" + note)[0];
+t("T30-1 注記の Zr → material=Zr、期待バー 13/14/15", () => {
+  const j = zrJob("d2 Zr Br #23-35 全3/支2/ポ1/ユ0");
+  eq(j.material, "Zr"); eq(j.expectedBars, ZR); eq(j.fissure, false);
+  eq(A.parseNoteLine("d2 zr Br #23-35 全3").material, "zr", "大文字小文字は無視・原文を保存");
+});
+t("T30-2 NC名の _Zr_ トークンからも material=Zr（注記に材料なし）", () => {
+  eq(A.parseNcPath("C:\\x\\261019_Zr_14L_d2_b1_20261019_1357.iso").material, "Zr");
+  const j = zrJob("d2 Br #23-35 全3", "C:\\x\\261019_Zr_14L_d2_b1_20261019_1357.iso");
+  eq(j.material, "Zr"); eq(j.expectedBars, ZR);
+});
+t("T30-3 Zr ＋ Fissure → 13/14/33、fissure=true", () => {
+  const j = zrJob("d2 Zr Br Fissure #23-35 全3");
+  eq(j.fissure, true); eq(j.expectedBars, ZR_F); eq(j.templateName, null, "Fissure は templateName に入らない");
+  eq(A.expectedBars("Zr", null, true), ZR_F);
+});
+t("T30-4 TiA B ＋ Fissure → 61/62/64 のまま、fissure=true（バーは Zr のみ変更）", () => {
+  const j = zrJob("w1 TiA Br B Fissure #45-47 全3", "C:\\x\\261019_TiA_10T_w1_b1_20261019_1000.iso");
+  eq(j.template, "B"); eq(j.fissure, true); eq(j.expectedBars, [61,62,64]);
+});
+t("T30-5 expectedBars(\"Zr\", \"B\") → 13/14/15（template は無視）", () => {
+  eq(A.expectedBars("Zr", "B"), ZR);
+  eq(A.expectedBars("ZR", "C", false), ZR);
+});
+t("T30-6 Fissure / Normal が KIND のキーに誤マッチしない", () => {
+  eq(A.parseNoteLine("d2 Zr Cr Normal_Fissure #16 全1").kind, "Cr");
+  eq(A.parseNoteLine("d2 Zr Br Normal Fissure #23-35 全3").kind, "Br");
+  eq(A.parseNoteLine("d2 Zr Fissure Normal #16").kind, undefined, "種別を書かなければ種別なし");
+});
+t("T30-7 d2 の Zr ジョブが順序型で 13→14→15 を消費する", () => {
+  const snap = {id:"s_d2", machine:"d2", takenAt:"2026-09-08T09:00",
+    tools:[13,14,15].map(slot => ({slot, type:slot, run:0, max:0, cut:0, flag:0}))};
+  const db = {snapshots:[snap], exchanges:[], jobs:[], segments:[
+    {machine:"d2", slot:13, a:"2026-09-07T14:00:00", b:"2026-09-07T14:20:00"},
+    {machine:"d2", slot:14, a:"2026-09-07T14:21:00", b:"2026-09-07T14:40:00"},
+    {machine:"d2", slot:15, a:"2026-09-07T14:41:00", b:"2026-09-07T14:50:00"}
+  ]};
+  const j = {...zrJob("d2 Zr Br #23-35 全3", "C:\\x\\260907_14L_d2_b1_20260907_1357.iso"), id:"zr", date:"2026-09-07"};
+  const mt = A.matchSegments(db, j, "2026-09-07", null);
+  eq(mt.picked.map(p => p.bar), ZR); ok(!mt.estimated, "推定ではない");
+});
+
+console.log("\n=== T31: テンプレ名の分離（v0.13.3） ===");
+t("T31-1 Normal → templateName=\"Normal\"（null にも空にもならない）", () => {
+  eq(A.parseNoteLine("d2 Zr Cr Normal #16 全1").templateName, "Normal");
+  eq(A.parseNoteLine("d2 CAD Cr normal #16 全1").templateName, "normal", "原文のまま");
+  eq(A.parseNoteLine("d2 Zr Cr Normal #16 全1").fissure, false);
+});
+t("T31-2 Normal_Fissure → Normal, fissure=true", () => {
+  const r = A.parseNoteLine("d2 Zr Cr Normal_Fissure #16 全1");
+  eq(r.templateName, "Normal"); eq(r.fissure, true);
+});
+t("T31-3 Slow_Fissure / Slow Fissure → Slow, fissure=true", () => {
+  for(const n of ["d2 Zr Cr Slow_Fissure #16 全1", "d2 Zr Cr Slow Fissure #16 全1"]){
+    const r = A.parseNoteLine(n);
+    eq(r.templateName, "Slow", n); eq(r.fissure, true, n);
+  }
+});
+t("T31-4 long_inside / insurance_v2 / Slow の既存挙動が変わらない", () => {
+  eq(A.parseNoteLine("w2 TiA Cr C(long_inside) #16 全1").templateName, "long_inside");
+  eq(A.parseNoteLine("w2 TiA Cr C(long_inside_Fissure) #16 全1").templateName, "long_inside");
+  eq(A.parseNoteLine("d2 CAD Cr insurance_v2 #22 全1").templateName, "insurance_v2");
+  eq(A.parseNoteLine("w1 TiA Br B #45-47 Slow 全3").templateName, "Slow");
+  eq(A.parseNoteLine("w1 TiA Br B #45-47 Normal Slow 全3").templateName, "Slow", "配列の順＝優先（注記中の位置ではない）");
+  eq(A.parseNoteLine("w1 TiA Br B #45-47 全3").fissure, false);
+});
+t("T31-5 MAT_TOKENS / TEMPLATE_TOKENS は配列。それ以外の語（Fast・Fissured）は拾わない", () => {
+  ok(Array.isArray(A.MAT_TOKENS) && Array.isArray(A.TEMPLATE_TOKENS), "配列");
+  eq(A.TEMPLATE_TOKENS, ["long_inside","Slow","Normal"]);
+  eq(A.parseNoteLine("d2 CAD Cr Fast #16 全1").templateName, undefined);
+  eq(A.parseNoteLine("d2 Zr Cr Fissured #16 全1").fissure, false, "前後が英数字なら不一致");
+  eq(A.parseNoteLine("d2 Zr Cr Slowly #16 全1").templateName, undefined);
+});
+t("T31-6 CSV 列26「裂溝」と画面の裂溝タグ", () => {
+  const db = {snapshots:[], exchanges:[], segments:[], jobs:[
+    {id:"f", date:"2026-09-07", hhmm:"1357", machine:"d2", kind:"Br", units:3, templateName:"Slow", fissure:true, expectedBars:ZR_F},
+    {id:"n", date:"2026-09-07", hhmm:"1400", machine:"d2", kind:"Cr", expectedBars:ZR}
+  ]};
+  const rows = csvRows(A.jobsCsv(db));
+  eq(rows[1][HEAD27.indexOf("裂溝")], "1"); eq(rows[2][HEAD27.indexOf("裂溝")], "");
+  eq(A.fmtUnits({kind:"Br", teeth:"23-35", templateName:"Slow", fissure:true, units:3, userdef:0}), "ブリッジ #23-35 Slow 裂溝 全3/ユ0");
+  eq(A.fmtUnits({kind:"Cr", fissure:false}), "クラウン");
+});
+
+console.log("\n=== T32: 認識語の一覧（v0.13.3） ===");
+t("T32-1 init 後の jobTokens に定数の全要素が出る", () => {
+  const h = APP.els.jobTokens.innerHTML;
+  for(const w of [...A.MAT_TOKENS, ...Object.keys(A.KIND), ...A.TEMPLATE_TOKENS, A.FISSURE_TOKEN, "CAD"])
+    ok(h.includes(w), w + " が無い: " + h);
+});
+t("T32-2 MAT_TOKENS に足すと一覧にも出る（手書きでない）", () => {
+  A.MAT_TOKENS.push("ZzTest");
+  try{ A.renderJobTokens(); ok(APP.els.jobTokens.innerHTML.includes("ZzTest")); }
+  finally{ A.MAT_TOKENS.pop(); A.renderJobTokens(); }
+  ok(!APP.els.jobTokens.innerHTML.includes("ZzTest"), "戻した");
+});
+
+console.log("\n=== T33: 交換履歴の表示制限（v0.13.3） ===");
+const MS = ["d1","d2","w1","w2"];
+function exDb(n){
+  return {snapshots:[], jobs:[], segments:[], exchanges:Array.from({length:n}, (_, i) => ({
+    id:"e"+i, machine:MS[i % 4], type:50, finalRun:1, cutAtExchange:1,
+    detectedAt:"2026-09-" + String(1 + (i >> 1)).padStart(2,"0") + "T" + (i % 2 ? "15" : "09") + ":00",
+    prevTakenAt:"2026-08-31T18:00"}))};
+}
+const exHtml = () => APP.els.exchangeArea.innerHTML;
+const bodyRows = () => (exHtml().split("<tbody>")[1] || "").split("<tr>").length - 1;
+function withEx(db, fn){
+  APP.store.set("toolltm.v1", JSON.stringify(db));
+  try{ fn(); } finally{ APP.store.delete("toolltm.v1"); A.setExView({machine:"", showAll:false}); }
+}
+t("T33-1 25件 → 本体行10件、最新10件を表示中（全25件）", () => withEx(exDb(25), () => {
+  A.renderExchanges();
+  eq(A.EX_DEFAULT_LIMIT, 10);
+  eq(bodyRows(), 10);
+  ok(exHtml().includes("最新10件を表示中（全25件）"), "件数行");
+  ok(exHtml().includes("すべて表示"), "切替ボタン");
+  ok(exHtml().indexOf("e24") < exHtml().indexOf("e15") && !exHtml().includes("'e14'"), "新しい順に先頭10件");
+}));
+t("T33-2 showAll → 25件、全25件を表示中", () => withEx(exDb(25), () => {
+  A.setExView({showAll:true});
+  eq(bodyRows(), 25);
+  ok(exHtml().includes("全25件を表示中") && exHtml().includes("最新10件に戻す"));
+}));
+t("T33-3 machine=w2 → w2 の行だけ、件数行に w2:", () => withEx(exDb(25), () => {
+  A.setExView({machine:"w2", showAll:false});
+  eq(bodyRows(), 6, "w2 は 25件中6件");
+  ok(exHtml().includes("w2: "), "件数行");
+  ok(!/<td>d1<\/td>/.test(exHtml()), "他マシンの行が無い");
+  ok(exHtml().includes('<option value="w2" selected>'), "select が絞り込み値を保持");
+}));
+t("T33-4 制限中に renderExchanges() で再描画しても exView が保たれる", () => withEx(exDb(25), () => {
+  A.setExView({machine:"d1"});
+  A.renderExchanges();
+  eq(A.exView, {machine:"d1", showAll:false});
+  eq(bodyRows(), 7);
+  ok(exHtml().includes("d1: 全7件を表示中"), "件数行: " + exHtml().match(/id='exCount'>[^<]*/));
+}));
+t("T33-5 空なら「まだ交換イベントの記録なし。」、絞り込みで0件なら「該当なし。」", () => {
+  withEx({snapshots:[], jobs:[], segments:[], exchanges:[]}, () => {
+    A.renderExchanges(); eq(APP.els.exchangeArea.textContent, "まだ交換イベントの記録なし。");
+  });
+  withEx(exDb(3), () => {                     // d1/d2/w1 のみ
+    A.setExView({machine:"w2"});
+    ok(exHtml().includes("該当なし。") && !exHtml().includes("<table>"));
+  });
 });
 
 (async () => {

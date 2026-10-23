@@ -69,7 +69,7 @@
 
 <header>
   <h1>Tool<span>Ltm</span></h1>
-  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.13.2</div>
+  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.13.3</div>
 </header>
 
 <h2>0. USBフォルダ一括取り込み</h2>
@@ -142,7 +142,8 @@
     </label>
     <label>加工日 <input type="date" id="jobDate" style="background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:7px 12px"></label>
   </div>
-  <textarea id="jobInput" placeholder="hyperDENTのログを貼り付け（NC出力パスの行と、その直後の注記行。複数ジョブまとめて可）&#10;例:&#10;C:\Users\Public\Documents\hyperDENT\NC Output_wet1\260618_TiA_10T_w1_b1_20260706_1014.iso&#10;w1 TiA Br B #45-47 全3 前2 支台2 ポン1 ユ6"></textarea>
+  <textarea id="jobInput" placeholder="hyperDENTのログを貼り付け（NC出力パスの行と、その直後の注記行。複数ジョブまとめて可）&#10;例:&#10;C:\Users\Public\Documents\hyperDENT\NC Output_wet1\260618_TiA_10T_w1_b1_20260706_1014.iso&#10;w1 TiA Br B #45-47 全3 前2 支台2 ポン1 ユ6&#10;d2 Zr Br Fissure #23-35 全3"></textarea>
+  <div class="msg" id="jobTokens"></div>
   <div class="btnrow">
     <button class="primary" id="btnJobParse">解析</button>
     <button id="btnJobSave" disabled>登録</button>
@@ -190,6 +191,14 @@
 <script>
 "use strict";
 // ---------- 変更履歴 ----------
+// v0.13.3 (2026-10-20)
+//  ⑨ 材料トークンを MAT_TOKENS に一本化（NC名・注記の両方がこの配列から正規表現を組み立てる）し、Zr を追加
+//  ⑩ expectedBars に Zr 分岐と第3引数 fissure（Zr=13/14/15、Zr＋Fissure=13/14/33。Zr は template を見ない）
+//  ⑪ templateName に Normal を追加（空に正規化しない＝空は未記入、Normal は明示）。long_inside/Slow/Normal は TEMPLATE_TOKENS の順で、
+//     前後が英数字でなければ一致（_ を区切り扱い）。Fissure は templateName に混ぜず job.fissure として独立に記録（材料を問わず）
+//  ⑫ 貼り付け欄の下に「認識する語」を定数から生成して表示（renderJobTokens）
+//  ⑬ 交換履歴: 既定で最新 EX_DEFAULT_LIMIT=10 件＋「すべて表示」＋マシン絞り込み（exView。localStorage には保存しない）
+//  ⑭ 加工記録CSVに列26「裂溝」、画面の加工物欄に「裂溝」タグ
 // v0.13.2 (2026-09-11)
 //  ⑧ 修正: 2パス目の救済が、探索範囲の先頭に別系統の孤児セグメントがあると打ち切られていた。
 //     指示書v0.13§⑤の「最初の E[0] から消費」に合わせ、2パス目のみ E[0] まで読み飛ばす。1パス目の打ち切りは従来どおり。
@@ -364,6 +373,14 @@ const BAR_MAP = {
 };
 // I. 略語辞書
 const KIND = {Cr:"クラウン", In:"インレー", On:"アンレー", Br:"ブリッジ", Con:"連結冠", 石支台:"石膏支台"};
+// v0.13.3⑨ 材料トークン。NC名・注記の判定と「認識する語」の表示はすべてこの配列から作る（追加は1か所で済む）
+const MAT_TOKENS = ["TiA","TiP","Zr","Stone","WAX","PMMA","PEEK","HR"];
+// v0.13.3⑪ テンプレ名（戦略）。配列の順＝優先順位（先頭から試し、最初に当たった語を採る）
+const TEMPLATE_TOKENS = ["long_inside","Slow","Normal"];
+// v0.13.3⑪ 裂溝の修飾子。戦略ではなくバーセットの修飾なので templateName とは別に job.fissure に持つ
+const FISSURE_TOKEN = "Fissure";
+// 前後が英数字でなければ一致（\b と違い _ を区切りとして扱う。Slow_Fissure の Slow を拾うため）
+const tokenRe = w => new RegExp("(?<![A-Za-z0-9])(" + w + ")(?![A-Za-z0-9])", "i");
 // C. NC出力パス行から素材/厚み/マシン/ブランク/時刻を抽出
 function parseNcPath(line){
   const m = /([^\\\/]+)\.iso\s*$/i.exec(line.trim());
@@ -375,7 +392,8 @@ function parseNcPath(line){
   const tm = base.match(/_(\d{8})_(\d{4})$/) || base.match(/_(\d{4})$/);
   if(tm){ r.hhmm = tm[tm.length-1]; if(tm.length===3) r.ymd = tm[1]; }
   // 素材トークン
-  const matToken = parts.find(p => /^(TiA|TiP|Stone|WAX|PMMA|PEEK|HR)$/i.test(p));
+  const matRe = new RegExp("^(" + MAT_TOKENS.join("|") + ")$", "i");
+  const matToken = parts.find(p => matRe.test(p));
   if(matToken) r.material = matToken;
   // 厚みトークン 例 10T / 14L / 30T
   const th = parts.find(p => /^\d+(T|L|XLL|XL)$/i.test(p));
@@ -404,7 +422,7 @@ function parseNoteLine(line){
     if(hit){ r.kind = k; break; }
   }
   // 材料（テンプレ抽出より先に確定させる: 単独A/B/CのフォールバックをMetal系限定にするため）
-  const mat = s.match(/\b(TiA|TiP|Stone|WAX|PMMA|PEEK|HR)\b/i); if(mat) r.material = mat[1];
+  const mat = s.match(new RegExp("\\b(" + MAT_TOKENS.join("|") + ")\\b", "i")); if(mat) r.material = mat[1];
   // CAD注記（第2信号）: "CAD Cr" 等 → CAD/CAM冠確定。PEEKが明記されていればそちら優先
   if(/\bCAD\b/i.test(s) && !/PEEK/i.test(s)) r.material = "CADCAM";
   // テンプレA/B/C: "TiA B"の並びは常に採用。単独大文字のフォールバックはMetal系(TiA/TiP)ジョブのみ。
@@ -429,19 +447,22 @@ function parseNoteLine(line){
   if(bs) r.blockSize = bs[1];
   // テンプレート名（insurance_v2 等）: 文字列として保持するだけ。辞書は持たない
   // v0.13⑥: long_inside を追加（歯冠長が長い症例のテンプレ。内面の最終加工だけ2mmバーになる＝尻尾セグメントの目印）
-  const tn = s.match(/\b([A-Za-z]+_v\d+)\b/) || s.match(/\b(insurance\w*)\b/i)
-          || s.match(/\b(long_inside)\b/i) || s.match(/\b(Slow)\b/i);
+  // v0.13.3⑪ long_inside/Slow/Normal は TEMPLATE_TOKENS の順に試す（1本の選択肢にすると注記中で左の語が勝ってしまう）
+  let tn = s.match(/\b([A-Za-z]+_v\d+)\b/) || s.match(/\b(insurance\w*)\b/i);
+  for(const w of TEMPLATE_TOKENS){ if(tn) break; tn = s.match(tokenRe(w)); }
   if(tn) r.templateName = tn[1];
+  r.fissure = tokenRe(FISSURE_TOKEN).test(s);
   return r;
 }
-// A. 材料+テンプレ→期待バー
-function expectedBars(material, template){
+// A. 材料+テンプレ→期待バー（v0.13.3⑩ fissure は Zr のときだけ効く。省略可）
+function expectedBars(material, template, fissure){
   if(!material) return null;
   const M = material.toUpperCase();
   if(M==="STONE"||M==="PEEK"||M==="PMMA"||M==="WAX") return BAR_MAP.Stone;
   if(M==="HR"||M==="CADCAM") return BAR_MAP.HR;
   if(M==="TIA"||M==="TIP"){ const t=(template||"").toUpperCase();
     return BAR_MAP["TiA_"+(t==="B"?"B":t==="C"?"C":"A")]; }
+  if(M==="ZR") return fissure ? BAR_MAP.Zr_Fissure : BAR_MAP.Zr;   // Zr にテンプレA/B/Cの区分は無い
   return null;
 }
 // E. ユニット内訳の補完
@@ -477,11 +498,11 @@ function parseJobLog(text){
         thick: nc.thick || (nc.isBlock ? note.blockSize : null) || null, blank: note.blank||nc.blank||null, slot: note.slot||null,
         isBlock: nc.isBlock,
         kind: note.kind||null, template: note.template||null, teeth: note.teeth||null,
-        templateName: note.templateName||null,
+        templateName: note.templateName||null, fissure: !!note.fissure,
         units: note.units, abut: note.abut, pontic: note.pontic, veneer: note.veneer, userdef: note.userdef,
         note: note.note||""
       };
-      job.expectedBars = expectedBars(job.material, job.template);
+      job.expectedBars = expectedBars(job.material, job.template, job.fissure);
       // 主信号: ブロックで材料不明 → CAD/CAM冠と仮定（実態99%）。注記のCAD/PEEKがあれば上で確定済み
       if(!job.material && job.isBlock){
         job.material = "CADCAM"; job.materialAssumed = true;
@@ -678,12 +699,29 @@ function editExMemo(id){
   e.memo = v.trim() ? v.trim() : null;
   saveDB(db); renderExchanges();
 }
+// v0.13.3⑬ 交換履歴の表示状態。localStorage には保存しない（リロードで既定に戻る）
+const EX_DEFAULT_LIMIT = 10;
+const exView = {machine:"", showAll:false};
+function setExView(patch){ Object.assign(exView, patch); renderExchanges(); }
 function renderExchanges(){
   const db = loadDB();
   const area = $("exchangeArea");
   if(!db.exchanges.length){ area.className="empty"; area.textContent="まだ交換イベントの記録なし。"; return; }
-  let html = `<table><thead><tr><th>検知日</th><th>マシン</th><th>バー</th><th>生涯RunTime</th><th>交換時Cutting累計</th><th>理由</th><th>前回観測</th><th></th></tr></thead><tbody>`;
-  for(const e of [...db.exchanges].sort((a,b)=>a.detectedAt<b.detectedAt?1:-1)){
+  const ctl = `<div class="row" style="margin-bottom:8px"><label>マシン <select onchange="setExView({machine:this.value})">`
+    + ["","d1","d2","w1","w2"].map(m=>`<option value="${m}"${exView.machine===m?" selected":""}>${m||"全部"}</option>`).join("")
+    + `</select></label></div>`;
+  const all = db.exchanges.filter(e => !exView.machine || e.machine === exView.machine)
+    .sort((a,b)=>a.detectedAt<b.detectedAt?1:-1);
+  if(!all.length){ area.className=""; area.innerHTML = ctl + `<div class="empty">該当なし。</div>`; return; }
+  const list = exView.showAll ? all : all.slice(0, EX_DEFAULT_LIMIT);
+  const scope = exView.machine ? exView.machine + ": " : "";
+  const btn = (patch, label) => ` <button class="ghost" style="padding:2px 8px;font-size:11px" onclick="setExView(${patch})">${label}</button>`;
+  // 件数が上限以下なら切替ボタンは出さない（押しても表示が変わらないため）
+  const count = all.length <= EX_DEFAULT_LIMIT ? `${scope}全${all.length}件を表示中`
+    : exView.showAll ? `${scope}全${all.length}件を表示中` + btn("{showAll:false}", `最新${EX_DEFAULT_LIMIT}件に戻す`)
+    : `最新${EX_DEFAULT_LIMIT}件を表示中（${scope}全${all.length}件）` + btn("{showAll:true}", "すべて表示");
+  let html = ctl + `<table><thead><tr><th>検知日</th><th>マシン</th><th>バー</th><th>生涯RunTime</th><th>交換時Cutting累計</th><th>理由</th><th>前回観測</th><th></th></tr></thead><tbody>`;
+  for(const e of list){
     const sel = `<select style="padding:2px 6px;font-size:12px" onchange="setExReason('${e.id}',this.value)">`
       + `<option value=""${e.reason?"":" selected"}></option>`
       + EX_REASONS.map(r=>`<option value="${r}"${e.reason===r?" selected":""}>${r}</option>`).join("")
@@ -693,7 +731,8 @@ function renderExchanges(){
       <td>${sel}${e.memo?' <span title="'+esc(e.memo)+'">📝</span>':''}</td><td>${e.prevTakenAt.replace("T"," ")}</td>
       <td><button class="ghost" style="padding:2px 8px;font-size:11px" onclick="editExMemo('${e.id}')">メモ</button> <button class="ghost" style="padding:2px 8px;font-size:11px" onclick="editExchange('${e.id}')">編集</button> <button class="ghost" style="padding:2px 8px;font-size:11px" onclick="delExchange('${e.id}')">削除</button></td></tr>`;
   }
-  html += "</tbody></table><div class='msg'>「生涯RunTime」は前回スナップショット時点の値。前回取得〜交換の間に加工があった分は含まれない（＝下限値）。厳密値が要る場合は交換直前にもコピーを取ること。「手入力」バッジは機械画面のメモ/写真値で補正済みの行。「理由」は後から埋める運用でよい（交換検知時に入力を強制しない）。</div>";
+  html += `</tbody></table><div class='msg' id='exCount'>${count}</div>`;
+  html += "<div class='msg'>「生涯RunTime」は前回スナップショット時点の値。前回取得〜交換の間に加工があった分は含まれない（＝下限値）。厳密値が要る場合は交換直前にもコピーを取ること。「手入力」バッジは機械画面のメモ/写真値で補正済みの行。「理由」は後から埋める運用でよい（交換検知時に入力を強制しない）。</div>";
   area.className = "";
   area.innerHTML = html;
 }
@@ -841,13 +880,13 @@ function jobTeethCount(j){
   if(j.kind === "Cr" || j.kind === "In" || j.kind === "On" || j.kind === "石支台") return 1;
   return "";
 }
-// v0.13.1⑦ 加工記録CSV。1行1ジョブ・25列。集計はExcelのピボット側で行う（アプリ内に集計画面は作らない）。
+// v0.13.1⑦ 加工記録CSV。1行1ジョブ・26列（v0.13.3⑭で列26「裂溝」を追加）。集計はExcelのピボット側で行う（アプリ内に集計画面は作らない）。
 function jobsCsv(db){
   const list = db.jobs.slice().sort(byDateTime);
   const res = computeJobMatches(db, list);
   const head = ["日付","時刻","マシン","種別","材料","厚み","テンプレ","テンプレ名","歯式",
                 "全","支台","ポン","前","ユ","期待バー","実消費(バー別)",
-                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)"];
+                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)","裂溝"];
   let csv = "\uFEFF" + head.join(",") + "\n";
   for(const j of list){
     const r = res[j.id] || {};
@@ -889,7 +928,8 @@ function jobsCsv(db){
       totalSec === "" ? "" : secToHms(totalSec),
       tags.join("+"),
       csvCell(j.note ?? ""),
-      jobTeethCount(j)
+      jobTeethCount(j),
+      j.fissure ? 1 : ""
     ].join(",") + "\n";
   }
   return csv;
@@ -1117,6 +1157,7 @@ function fmtUnits(j){
   if(j.teeth) p.push("#"+j.teeth);
   if(j.template) p.push("テンプレ"+j.template);
   if(j.templateName) p.push(j.templateName);
+  if(j.fissure) p.push("裂溝");
   const u=[];
   if(j.units!=null)u.push("全"+j.units); if(j.abut!=null)u.push("支"+j.abut);
   if(j.pontic!=null)u.push("ポ"+j.pontic); if(j.veneer!=null)u.push("前"+j.veneer);
@@ -1223,8 +1264,17 @@ $("btnJobShow").onclick = renderJobs;
 const today=new Date().toISOString().slice(0,10);
 $("jobDate").value=today; $("segDate").value=$("segDate").value||today;
 
+// v0.13.3⑫ 貼り付け欄の下の「認識する語」。文字列を手書きせず定数から作る（コードと画面の食い違いを防ぐ）
+function renderJobTokens(){
+  $("jobTokens").innerHTML =
+    "認識する語 — 材料: " + [...MAT_TOKENS, "CAD"].map(esc).join(" / ") + "　テンプレ: A B C（TiA/TiP のみ）"
+    + "　種別: " + Object.keys(KIND).map(esc).join(" ") + "<br>"
+    + "戦略: " + [...TEMPLATE_TOKENS, "insurance_vN"].map(esc).join(" ") + "　修飾: " + esc(FISSURE_TOKEN)
+    + "　数量: 全N 支台N ポンN 前N ユN　歯式: #45-47";
+}
+
 // ---------- init ----------
-renderExchanges(); renderSnapList();
+renderExchanges(); renderSnapList(); renderJobTokens();
 </script>
 </body>
 </html>
