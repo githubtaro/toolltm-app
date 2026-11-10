@@ -24,6 +24,7 @@
 //   T27 加工記録CSV の列とエスケープ（v0.13.1）
 //   T28 画面とCSVが同じ突合結果を使う
 //   T29 役割列と尻尾秒
+//   T34 CSV NC名列  T35 部分  T36 ブロックNC名の日付（v0.13.4）
 //   T30 Zr と裂溝の期待バー（v0.13.3）  T31 テンプレ名の分離（Normal / Fissure）
 //   T32 認識語の一覧                  T33 交換履歴の表示制限
 //
@@ -935,7 +936,7 @@ t("T23-5 setExReason は保存し、空選択で null に戻る", () => {
 console.log("\n=== T27: jobsCsv の列とエスケープ（v0.13.1） ===");
 const HEAD27 = ["日付","時刻","マシン","種別","材料","厚み","テンプレ","テンプレ名","歯式",
                 "全","支台","ポン","前","ユ","期待バー","実消費(バー別)",
-                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)","裂溝"];
+                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)","裂溝","NC名"];
 function csvRows(csv){                       // クォート内の改行を潰さずに行へ割る素朴なパーサ
   const rows = []; let cur = [], f = "", q = false;
   for(let i=0;i<csv.length;i++){
@@ -953,7 +954,7 @@ function csvRows(csv){                       // クォート内の改行を潰�
   rows[0][0] = rows[0][0].replace(/^\uFEFF/, "");
   return rows;
 }
-t("T27-1 ヘッダが26列・指定の順で出る（BOM付き。v0.13.3 で列26「裂溝」を追加）", () => {
+t("T27-1 ヘッダが27列・指定の順で出る（BOM付き。v0.13.3 で列26「裂溝」、v0.13.4 で列27「NC名」を追加）", () => {
   const csv = A.jobsCsv({jobs:[], segments:[], snapshots:[], exchanges:[]});
   ok(csv.startsWith("\uFEFF"), "BOM");
   eq(csvRows(csv)[0], HEAD27);
@@ -1041,10 +1042,10 @@ t("T28-1 9/7 d1 の状態列が 救済 / ok / 未突合 になる", () => {
   const st = {};
   for(const r of rows) st[r[1] + "_" + r[HEAD27.indexOf("歯式")]] = r[HEAD27.indexOf("状態")];
   const byTime = Object.fromEntries(rows.map(r => [r[1], r[HEAD27.indexOf("状態")]]));
-  eq(byTime["11:34"], "救済", "#27 は2パス目で救済");
+  eq(byTime["11:34"], "救済+部分", "#27 は2パス目で救済（11,12 のみ＝部分。v0.13.4）");
   eq(byTime["13:13"], "ok",   "#25 は通常突合");
   eq(byTime["17:44"], "未突合", "#45 は枯渇");
-  eq(byTime["17:42"], "ok",   "#12 は 11,12 のみでも ok");
+  eq(byTime["17:42"], "ok+部分", "#12 は 11,12 のみ＝部分（v0.13.4。以前は ok）");
 });
 t("T28-2 CSV と computeJobMatches の結果が一致する（二重実装になっていない）", () => {
   const db = d1db();
@@ -1346,6 +1347,80 @@ t("T33-5 空なら「まだ交換イベントの記録なし。」、絞り込�
     A.setExView({machine:"w2"});
     ok(exHtml().includes("該当なし。") && !exHtml().includes("<table>"));
   });
+});
+
+console.log("\n=== T34: CSV の NC名列（v0.13.4） ===");
+t("T34-1 ヘッダが27列で末尾が NC名", () => {
+  const h = csvRows(A.jobsCsv({jobs:[], segments:[], snapshots:[], exchanges:[]}))[0];
+  eq(h.length, 27); eq(h[26], "NC名"); eq(h, HEAD27);
+});
+t("T34-2 値は j.raw と一致し、raw の無いジョブは空", () => {
+  const db = {snapshots:[], exchanges:[], segments:[], jobs:[
+    {id:"a", date:"2026-09-07", hhmm:"0900", machine:"d1", kind:"Cr", raw:"260618_TiA_10T_w1_b1_20260706_1014"},
+    {id:"b", date:"2026-09-07", hhmm:"1000", machine:"d1", kind:"Cr"}
+  ]};
+  const rows = csvRows(A.jobsCsv(db)).slice(1), i = HEAD27.indexOf("NC名");
+  eq(rows[0][i], "260618_TiA_10T_w1_b1_20260706_1014"); eq(rows[1][i], "");
+});
+
+console.log("\n=== T35: 状態「部分」（v0.13.4） ===");
+const stOf = (db, hhmm) => csvRows(A.jobsCsv(db)).slice(1).find(r => r[1] === hhmm)[HEAD27.indexOf("状態")];
+const sj = (id, hhmm, extra) => ({id, date:"2026-09-07", hhmm, machine:"d1", kind:"石支台", expectedBars:STONE, raw:id, ...extra});
+t("T35-1 11→12 のみ消費 → ok+部分、役割3秒が空", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[sj("p","0855")], segments:[
+    seg("d1",1,"09:00:00","09:10:00"), seg("d1",2,"09:11:00","09:20:00")]};
+  eq(stOf(db,"08:55"), "ok+部分");
+  eq(csvRows(A.jobsCsv(db))[1][HEAD27.indexOf("役割3秒")], "");
+});
+t("T35-2 11→12→16 を消費 → ok（部分なし）", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[sj("p","0855")], segments:[
+    seg("d1",1,"09:00:00","09:10:00"), seg("d1",2,"09:11:00","09:20:00"), seg("d1",3,"09:21:00","09:25:00")]};
+  eq(stOf(db,"08:55"), "ok");
+});
+t("T35-3 救済で 2本だけ拾えた → 救済+部分（9/7 d1 #27）", () => {
+  eq(stOf(d1db(), "11:34"), "救済+部分");
+});
+t("T35-4 期待バー不明（推定）→ 推定 のみ", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[sj("p","0855",{expectedBars:null})], segments:[
+    seg("d1",1,"09:00:00","09:10:00"), seg("d1",2,"09:11:00","09:20:00")]};
+  eq(stOf(db,"08:55"), "推定");
+});
+t("T35-5 Br で全N無し・一巡途中 → ok+部分+全N欠（順序固定）", () => {
+  const db = {snapshots:[D1_SNAP], exchanges:[], jobs:[sj("p","0855",{kind:"Br", units:null, teeth:"45-47"})], segments:[
+    seg("d1",1,"09:00:00","09:10:00"), seg("d1",2,"09:11:00","09:20:00")]};
+  eq(stOf(db,"08:55"), "ok+部分+全N欠");
+});
+t("T35-6 画面の実消費欄に (部分) が出る（一巡した行には出ない）", () => {
+  APP.store.set("toolltm.v1", JSON.stringify(d1db()));
+  APP.el("jobViewMachine").value = ""; APP.el("jobViewDate").value = "";
+  A.renderJobs();
+  const html = APP.el("jobListArea").innerHTML;
+  const row = hh => html.split("<tr>").find(r => r.includes("<td>" + hh + "</td>")) || "";
+  ok(row("17:42").includes("(部分)"), "17:42 #12");
+  ok(!row("13:13").includes("(部分)"), "13:13 #25 は一巡");
+  APP.store.delete("toolltm.v1");
+});
+
+console.log("\n=== T36: ブロック NC名の日付（v0.13.4） ===");
+t("T36-1 ブロック名 165238430520261102_1556 → ymd/hhmm/isBlock/raw", () => {
+  const r = A.parseNcPath("C:\\Users\\Public\\Documents\\hyperDENT\\NC Output_wet1\\165238430520261102_1556.iso");
+  eq(r.ymd, "20261102"); eq(r.hhmm, "1556"); eq(r.isBlock, true); eq(r.raw, "165238430520261102_1556");
+});
+t("T36-2 ディスク形は変化なし", () => {
+  const r = A.parseNcPath("C:\\x\\260618_TiA_10T_w1_b1_20260706_1014.iso");
+  eq(r.ymd, "20260706"); eq(r.hhmm, "1014");
+});
+t("T36-3 暦日でない 12345678_1556 → ymd 無し、hhmm あり", () => {
+  const r = A.parseNcPath("C:\\x\\12345678_1556.iso");
+  eq(r.ymd, undefined); eq(r.hhmm, "1556");
+});
+t("T36-4 8桁が無い 1655_1556 → ymd 無し、hhmm あり", () => {
+  const r = A.parseNcPath("C:\\x\\1655_1556.iso");
+  eq(r.ymd, undefined); eq(r.hhmm, "1556");
+});
+t("T36-5 parseJobLog 経由でも ymd が入る（登録側が UI 日付より優先する値）", () => {
+  const jobs = A.parseJobLog("C:\\x\\NC Output_wet1\\165238430520261102_1556.iso\nw1 Cr #16 全1");
+  eq(jobs[0].ymd, "20261102"); eq(jobs[0].hhmm, "1556");
 });
 
 (async () => {

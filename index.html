@@ -69,7 +69,7 @@
 
 <header>
   <h1>Tool<span>Ltm</span></h1>
-  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.13.3</div>
+  <div class="sub">バーライフタイム台帳 — INI貼り付け＋加工物記録 / v0.13.4</div>
 </header>
 
 <h2>0. USBフォルダ一括取り込み</h2>
@@ -191,6 +191,10 @@
 <script>
 "use strict";
 // ---------- 変更履歴 ----------
+// v0.13.4 (2026-11-10)
+//  ⑭ 加工記録CSVに列27「NC名」（j.raw）を追加
+//  ⑮ 状態「部分」: 突合済み（推定を除く）で消費できたバー種が期待バー数未満の行。ok/救済/尻尾の後ろ・全N欠の前。画面の実消費欄にも (部分)
+//  ⑯ parseNcPath: ブロック名（_ 無し）の末尾 YYYYMMDD_HHMM から日付を読む（暦日の妥当性検査付き。ymdOk）
 // v0.13.3 (2026-10-20)
 //  ⑨ 材料トークンを MAT_TOKENS に一本化（NC名・注記の両方がこの配列から正規表現を組み立てる）し、Zr を追加
 //  ⑩ expectedBars に Zr 分岐と第3引数 fissure（Zr=13/14/15、Zr＋Fissure=13/14/33。Zr は template を見ない）
@@ -389,8 +393,10 @@ function parseNcPath(line){
   const parts = base.split("_");
   const r = { raw: base, isBlock: !/[a-zA-Z]/.test(base) };
   // 末尾 _HHMM を時刻に（その手前が日付8桁のことが多い）
-  const tm = base.match(/_(\d{8})_(\d{4})$/) || base.match(/_(\d{4})$/);
-  if(tm){ r.hhmm = tm[tm.length-1]; if(tm.length===3) r.ymd = tm[1]; }
+  // v0.13.4③: ブロック名（_ 無しで日付が数字列に直結）の末尾8桁＋_HHMM も読む。暦日として妥当なものだけ採用
+  const ymdOk = s => { const y=+s.slice(0,4), m=+s.slice(4,6), d=+s.slice(6,8); return y>=2020 && y<=2099 && m>=1 && m<=12 && d>=1 && d<=31; };
+  const tm = base.match(/_(\d{8})_(\d{4})$/) || base.match(/(\d{8})_(\d{4})$/) || base.match(/_(\d{4})$/);
+  if(tm){ r.hhmm = tm[tm.length-1]; if(tm.length===3 && ymdOk(tm[1])) r.ymd = tm[1]; }
   // 素材トークン
   const matRe = new RegExp("^(" + MAT_TOKENS.join("|") + ")$", "i");
   const matToken = parts.find(p => matRe.test(p));
@@ -886,7 +892,7 @@ function jobsCsv(db){
   const res = computeJobMatches(db, list);
   const head = ["日付","時刻","マシン","種別","材料","厚み","テンプレ","テンプレ名","歯式",
                 "全","支台","ポン","前","ユ","期待バー","実消費(バー別)",
-                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)","裂溝"];
+                "役割1秒","役割2秒","役割3秒","尻尾秒","合計秒","合計","状態","注記","歯数(算出)","裂溝","NC名"];
   let csv = "\uFEFF" + head.join(",") + "\n";
   for(const j of list){
     const r = res[j.id] || {};
@@ -900,6 +906,8 @@ function jobsCsv(db){
       if(mt.estimated) tags.push("推定");
       if(mt.tail) tags.push("尻尾");
       if(!tags.length) tags.push("ok");
+      // v0.13.4②: 期待バーを一巡できなかった行（推定は E が無いので対象外）
+      if(!mt.estimated && Object.keys(mt.used).length < E.length) tags.push("部分");
     }
     // v0.13.1 全N欠: Br/Con で全Nが無いと歯数(算出)が空になり、Excelの合計から黙って抜ける。
     // 状態列でフィルタして注記を直すための目印（突合の成否とは独立なので、どの状態にも付く）。
@@ -929,7 +937,8 @@ function jobsCsv(db){
       tags.join("+"),
       csvCell(j.note ?? ""),
       jobTeethCount(j),
-      j.fissure ? 1 : ""
+      j.fissure ? 1 : "",
+      csvCell(j.raw ?? "")
     ].join(",") + "\n";
   }
   return csv;
@@ -1248,6 +1257,7 @@ function renderJobs(){
       real=Object.keys(r.mt.used).sort((a,b)=>a-b).map(b=>`${b}=${secToHms(r.mt.used[b])}`).join(" / ");
       if(r.mt.tail) real+=" (尻尾)";
       if(r.mt.estimated) real+=" (推定)";
+      if(!r.mt.estimated && Object.keys(r.mt.used).length < (j.expectedBars||[]).length) real+=" (部分)";
       if(r.rescued) real+=' <span class="tag info">救済</span>';
     }
     html+=`<tr><td>${j.date}</td><td>${j.hhmm?j.hhmm.slice(0,2)+":"+j.hhmm.slice(2,4):"—"}</td><td>${j.machine||"?"}</td>
